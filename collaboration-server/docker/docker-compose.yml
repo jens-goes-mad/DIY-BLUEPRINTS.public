@@ -1,0 +1,62 @@
+services:
+  frontend:
+    restart: unless-stopped
+    build:
+      context: ../frontend
+    ports:
+      - "8090:80"
+    depends_on:
+      - collab-server
+
+  collab-server:
+    restart: unless-stopped
+    build:
+      context: ../backend/collab-server
+    ports:
+      - "1234:1234"
+      - "3000:3000"
+    environment:
+      - WS_PORT=1234
+      - HTTP_PORT=3000
+      - LIVE_STORE_PATH=/data/live
+      - GIT_CHECKPOINT_INTERVAL_MS=60000
+    volumes:
+      - live-data:/data/live
+
+  persistence-service:
+    restart: unless-stopped
+    build:
+      context: ../backend/persistence-service
+    ports:
+      - "8081:8080"
+    volumes:
+      - repo-data:/data/repo
+
+  git-frontend:
+    restart: unless-stopped
+    build:
+      context: ./git-frontend
+    ports:
+      - "8096:80"
+    volumes:
+      - repo-data:/data/repo:ro
+    depends_on:
+      - persistence-service
+
+  minio:
+    restart: unless-stopped
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    environment:
+      - MINIO_ROOT_USER=devuser
+      - MINIO_ROOT_PASSWORD=devpassword
+
+volumes:
+  repo-data:
+  live-data:
+  minio-data:

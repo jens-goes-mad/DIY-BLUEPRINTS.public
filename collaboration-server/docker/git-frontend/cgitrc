@@ -1,0 +1,14 @@
+css=/cgit.css
+logo=/cgit.png
+favicon=/favicon.ico
+root-title=Collaborative Editor
+root-desc=Git-backed snapshots of the collaborative document
+enable-index-links=1
+enable-blame=1
+enable-log-filecount=1
+enable-log-linecount=1
+snapshots=tar.gz zip
+
+repo.url=default
+repo.path=/data/repo/.git
+repo.desc=Collaborative document snapshots (Markdown + git blame audit trail)
