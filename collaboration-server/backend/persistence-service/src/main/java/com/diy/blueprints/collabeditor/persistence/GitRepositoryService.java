@@ -69,6 +69,20 @@ public class GitRepositoryService {
     return bytes == null ? "" : new String(bytes, StandardCharsets.UTF_8);
   }
 
+  /**
+   * The changelog committed alongside a snapshot holds only the individual
+   * per-save chunks since the *previous* commit on this branch (see
+   * DocumentController) -- not the whole history. To see further back,
+   * walk the branch's commit log and read each commit's own changelog blob.
+   */
+  public String loadChangelog(String docId, String branch) throws IOException {
+    byte[] bytes;
+    try (Repository repo = openRepo()) {
+      bytes = readBlob(repo, branch, docId + ".changelog.jsonl");
+    }
+    return bytes == null ? "" : new String(bytes, StandardCharsets.UTF_8);
+  }
+
   private byte[] readBlob(Repository repo, String branch, String path) throws IOException {
     ObjectId blobId = repo.resolve(branch + ":" + path);
     if (blobId == null) {
@@ -83,12 +97,13 @@ public class GitRepositoryService {
    * Writes a new commit for the given branch, never touching the working tree.
    * Any other files already present on the branch's tree are carried forward untouched.
    */
-  public synchronized String save(String docId, String branch, byte[] ydocBytes, String markdown, String author) throws IOException {
+  public synchronized String save(String docId, String branch, byte[] ydocBytes, String markdown,
+                                   String changelog, String author) throws IOException {
     try (Repository repo = openRepo()) {
       ObjectId branchHead = repo.resolve(branch);
 
       try (ObjectInserter inserter = repo.newObjectInserter()) {
-        ObjectId newTreeId = buildTree(repo, inserter, branchHead, docId, ydocBytes, markdown);
+        ObjectId newTreeId = buildTree(repo, inserter, branchHead, docId, ydocBytes, markdown, changelog);
 
         PersonIdent identity = new PersonIdent(author, author + "@collab.local");
         CommitBuilder commitBuilder = new CommitBuilder();
@@ -110,12 +125,15 @@ public class GitRepositoryService {
   }
 
   private ObjectId buildTree(Repository repo, ObjectInserter inserter, ObjectId branchHead,
-                              String docId, byte[] ydocBytes, String markdown) throws IOException {
+                              String docId, byte[] ydocBytes, String markdown, String changelog) throws IOException {
     ObjectId ydocBlobId = inserter.insert(Constants.OBJ_BLOB, ydocBytes);
     ObjectId mdBlobId = inserter.insert(Constants.OBJ_BLOB, markdown.getBytes(StandardCharsets.UTF_8));
+    ObjectId changelogBlobId = inserter.insert(Constants.OBJ_BLOB,
+        (changelog == null ? "" : changelog).getBytes(StandardCharsets.UTF_8));
 
     String ydocPath = docId + ".ydoc";
     String mdPath = docId + ".md";
+    String changelogPath = docId + ".changelog.jsonl";
 
     DirCache dirCache = DirCache.newInCore();
     DirCacheBuilder builder = dirCache.builder();
@@ -127,7 +145,7 @@ public class GitRepositoryService {
         treeWalk.setRecursive(true);
         while (treeWalk.next()) {
           String path = treeWalk.getPathString();
-          if (path.equals(ydocPath) || path.equals(mdPath)) {
+          if (path.equals(ydocPath) || path.equals(mdPath) || path.equals(changelogPath)) {
             continue; // superseded by the new blobs below
           }
           DirCacheEntry entry = new DirCacheEntry(path);
@@ -147,6 +165,11 @@ public class GitRepositoryService {
     mdEntry.setObjectId(mdBlobId);
     mdEntry.setFileMode(FileMode.REGULAR_FILE);
     builder.add(mdEntry);
+
+    DirCacheEntry changelogEntry = new DirCacheEntry(changelogPath);
+    changelogEntry.setObjectId(changelogBlobId);
+    changelogEntry.setFileMode(FileMode.REGULAR_FILE);
+    builder.add(changelogEntry);
 
     builder.finish();
     return dirCache.writeTree(inserter);

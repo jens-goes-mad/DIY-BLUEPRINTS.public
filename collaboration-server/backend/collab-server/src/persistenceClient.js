@@ -9,13 +9,14 @@ export async function loadSnapshot(docId) {
   return Buffer.from(body.ydoc, 'base64')
 }
 
-export async function saveSnapshot(docId, ydocBytes, markdown, author) {
+export async function saveSnapshot(docId, ydocBytes, markdown, changelog, author) {
   const res = await fetch(`${PERSISTENCE_URL}/api/documents/${docId}?branch=${BRANCH}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       ydoc: Buffer.from(ydocBytes).toString('base64'),
       markdown,
+      changelog,
       author,
     }),
   })

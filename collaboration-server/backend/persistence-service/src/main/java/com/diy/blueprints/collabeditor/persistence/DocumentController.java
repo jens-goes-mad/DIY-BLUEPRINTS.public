@@ -16,9 +16,9 @@ public class DocumentController {
     this.gitRepositoryService = gitRepositoryService;
   }
 
-  public record DocumentResponse(String docId, String branch, String ydoc, String markdown) {}
+  public record DocumentResponse(String docId, String branch, String ydoc, String markdown, String changelog) {}
 
-  public record SaveRequest(String ydoc, String markdown, String author) {}
+  public record SaveRequest(String ydoc, String markdown, String changelog, String author) {}
 
   public record CreateBranchRequest(String newBranch, String fromBranch) {}
 
@@ -29,8 +29,9 @@ public class DocumentController {
                                 @RequestParam(defaultValue = DEFAULT_BRANCH) String branch) throws Exception {
     byte[] ydocBytes = gitRepositoryService.loadSnapshot(docId, branch);
     String markdown = gitRepositoryService.loadMarkdown(docId, branch);
+    String changelog = gitRepositoryService.loadChangelog(docId, branch);
     String ydocBase64 = ydocBytes == null ? null : Base64.getEncoder().encodeToString(ydocBytes);
-    return new DocumentResponse(docId, branch, ydocBase64, markdown);
+    return new DocumentResponse(docId, branch, ydocBase64, markdown, changelog);
   }
 
   @PostMapping("/api/documents/{docId}")
@@ -38,7 +39,13 @@ public class DocumentController {
                     @RequestParam(defaultValue = DEFAULT_BRANCH) String branch,
                     @RequestBody SaveRequest request) throws Exception {
     byte[] ydocBytes = Base64.getDecoder().decode(request.ydoc());
-    gitRepositoryService.save(docId, branch, ydocBytes, request.markdown(), request.author());
+    gitRepositoryService.save(docId, branch, ydocBytes, request.markdown(), request.changelog(), request.author());
+  }
+
+  @GetMapping("/api/documents/{docId}/changelog")
+  public String changelog(@PathVariable String docId,
+                           @RequestParam(defaultValue = DEFAULT_BRANCH) String branch) throws Exception {
+    return gitRepositoryService.loadChangelog(docId, branch);
   }
 
   @GetMapping("/api/documents/{docId}/history")
