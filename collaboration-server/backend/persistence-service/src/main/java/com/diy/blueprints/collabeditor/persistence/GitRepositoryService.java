@@ -1,14 +1,12 @@
 package com.diy.blueprints.collabeditor.persistence;
 
 import org.eclipse.jgit.api.Git;
-import org.eclipse.jgit.api.MergeResult;
 import org.eclipse.jgit.blame.BlameResult;
 import org.eclipse.jgit.dircache.DirCache;
 import org.eclipse.jgit.dircache.DirCacheBuilder;
 import org.eclipse.jgit.dircache.DirCacheEntry;
 import org.eclipse.jgit.diff.RawText;
 import org.eclipse.jgit.lib.*;
-import org.eclipse.jgit.merge.MergeStrategy;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.revwalk.filter.RevFilter;
@@ -233,49 +231,47 @@ public class GitRepositoryService {
   /**
    * Records that mergedYdoc/mergedMarkdown (already produced by a Yjs CRDT merge
    * elsewhere) is the new state of targetBranch, resulting from combining it with
-   * sourceBranch. This is the one operation that touches the working tree: JGit's
-   * MergeCommand (with the "ours" strategy, so it never attempts a content merge)
-   * is used purely to create a real two-parent commit, which is then amended to
-   * swap in the actually-resolved content while its parents stay untouched.
+   * sourceBranch. Pure object-database plumbing, same approach as save() and for
+   * the same reason -- see the incident this replaced in STATE.md: the original
+   * implementation used JGit's MergeCommand + checkout + working-tree add/amend,
+   * which silently DROPPED unrelated files from the resulting commit's tree.
+   * save() never updates the working tree or index (by design, for concurrency),
+   * so JGit's index is permanently stale after any save() call; a later
+   * checkout-based commit builds its tree from that stale index rather than the
+   * branch's actual HEAD tree, losing anything the index didn't know about. Never
+   * touching the working tree at all avoids the whole class of bug.
    */
   public synchronized MergeOutcome merge(String docId, String targetBranch, String sourceBranch,
-                                          byte[] mergedYdoc, String mergedMarkdown, String author) throws Exception {
-    try (Git git = Git.open(repoRoot.toFile())) {
-      Repository repo = git.getRepository();
-
-      if (repo.resolve(targetBranch) == null || repo.resolve(sourceBranch) == null) {
+                                          byte[] mergedYdoc, String mergedMarkdown, String author) throws IOException {
+    try (Repository repo = openRepo()) {
+      ObjectId targetHead = repo.resolve(targetBranch);
+      ObjectId sourceHead = repo.resolve(sourceBranch);
+      if (targetHead == null || sourceHead == null) {
         throw new IllegalStateException("both branches must exist: " + targetBranch + ", " + sourceBranch);
       }
 
-      git.checkout().setName(targetBranch).call();
-      Ref sourceRef = repo.findRef(sourceBranch);
+      try (ObjectInserter inserter = repo.newObjectInserter()) {
+        ObjectId newTreeId = buildTree(repo, inserter, targetHead, docId, mergedYdoc, mergedMarkdown, null);
 
-      MergeResult mergeResult = git.merge()
-          .include(sourceRef)
-          .setStrategy(MergeStrategy.OURS)
-          .setCommit(true)
-          .setMessage("merge " + sourceBranch + " into " + targetBranch + " (pre-resolve)")
-          .call();
+        PersonIdent identity = new PersonIdent(author, author + "@collab.local");
+        CommitBuilder commitBuilder = new CommitBuilder();
+        commitBuilder.setTreeId(newTreeId);
+        commitBuilder.setParentIds(targetHead, sourceHead);
+        commitBuilder.setAuthor(identity);
+        commitBuilder.setCommitter(identity);
+        commitBuilder.setMessage("merge " + sourceBranch + " into " + targetBranch + " by " + author);
 
-      if (mergeResult.getMergeStatus() != MergeResult.MergeStatus.MERGED) {
-        return new MergeOutcome(false, mergeResult.getMergeStatus().toString(), null, 0);
+        ObjectId newCommitId = inserter.insert(commitBuilder);
+        inserter.flush();
+
+        updateBranchRef(repo, targetBranch, targetHead, newCommitId);
+
+        RevCommit parsed;
+        try (RevWalk revWalk = new RevWalk(repo)) {
+          parsed = revWalk.parseCommit(newCommitId);
+        }
+        return new MergeOutcome(true, "MERGED", newCommitId.getName(), parsed.getParentCount());
       }
-
-      Path ydocFile = repoRoot.resolve(docId + ".ydoc");
-      Path mdFile = repoRoot.resolve(docId + ".md");
-      Files.write(ydocFile, mergedYdoc);
-      Files.writeString(mdFile, mergedMarkdown, StandardCharsets.UTF_8);
-      git.add().addFilepattern(docId + ".ydoc").addFilepattern(docId + ".md").call();
-
-      PersonIdent identity = new PersonIdent(author, author + "@collab.local");
-      RevCommit finalCommit = git.commit()
-          .setAmend(true)
-          .setAuthor(identity)
-          .setCommitter(identity)
-          .setMessage("merge " + sourceBranch + " into " + targetBranch + " by " + author)
-          .call();
-
-      return new MergeOutcome(true, "MERGED", finalCommit.getName(), finalCommit.getParentCount());
     }
   }
 

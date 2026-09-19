@@ -118,5 +118,46 @@ async function testConflictingMerge() {
   console.log('master unchanged by the rejected merge:', beforeMerge.ydoc === afterMerge.ydoc)
 }
 
+// Regression test for a real incident (see STATE.md): the first merge()
+// implementation used JGit's checkout+working-tree-add+amend flow, which
+// silently DROPPED unrelated files from the resulting commit's tree --
+// because save() never touches the working tree/index by design, so it's
+// permanently stale, and a checkout-based commit builds its tree from that
+// stale index rather than the branch's actual HEAD tree. This directly
+// deleted real production content on "default" the first time a merge ran
+// on a branch that had unrelated save()s interleaved on it. The fix moved
+// merge() to the same pure object-database plumbing save() already used.
+async function testMergePreservesUnrelatedDocs() {
+  console.log('\n=== REGRESSION: merging one docId must not touch an UNRELATED docId on the same branch ===')
+  const bystanderDocId = `bystander-${RUN_ID}`
+  const mergeDocId = `merge-bystander-check-${RUN_ID}`
+  const branch = `feature-bystander-${RUN_ID}`
+
+  const bystander = makeDoc('This unrelated document must survive the merge untouched.')
+  await save(bystanderDocId, 'master', bystander, 'This unrelated document must survive the merge untouched.', 'User-1')
+  const bystanderBefore = await branchTip(bystanderDocId, 'master')
+
+  const base = makeDoc('Merge target base.')
+  await save(mergeDocId, 'master', base, 'Merge target base.', 'User-1')
+  await createBranch(branch, 'master')
+
+  const onFeature = new Y.Doc()
+  Y.applyUpdate(onFeature, Y.encodeStateAsUpdate(base))
+  onFeature.getXmlFragment('default').get(0).get(0).insert(18, ' Extended on feature.')
+  await save(mergeDocId, branch, onFeature, 'Merge target base. Extended on feature.', 'User-Feature')
+
+  const result = await mergeViaCollabServer(mergeDocId, branch, 'master', 'merge-bot')
+  console.log('merge result:', JSON.stringify(result.body))
+  console.log('merge succeeded:', result.body.merged === true)
+
+  const bystanderAfter = await branchTip(bystanderDocId, 'master')
+  console.log('bystander ydoc unchanged:', bystanderBefore.ydoc === bystanderAfter.ydoc)
+  console.log('bystander markdown unchanged:', bystanderBefore.markdown === bystanderAfter.markdown)
+  if (bystanderBefore.ydoc !== bystanderAfter.ydoc) {
+    throw new Error('REGRESSION: merge dropped an unrelated docId\'s content -- this is the exact incident from STATE.md')
+  }
+}
+
 await testCleanMerge()
 await testConflictingMerge()
+await testMergePreservesUnrelatedDocs()

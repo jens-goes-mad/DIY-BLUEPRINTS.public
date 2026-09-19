@@ -24,13 +24,26 @@ const markdownSerializer = createMarkdownSerializer()
 
 let userCounter = 0
 
-// documentName -> { document, dirty, contributors, lastSavedStateVector }
+// documentName -> { document, docId, branch, dirty, contributors, lastSavedStateVector }
 // lastSavedStateVector tracks what's already on disk (base+log), so each
 // fast-tier save only has to write what changed since then, not the whole
 // document -- essential once a document is hundreds of pages, where
 // re-encoding the full state on every ~8s debounce would mean rewriting the
 // entire thing repeatedly during any active editing session.
 const liveDocuments = new Map()
+
+// Hocuspocus's documentName is the identity of a live collaboration "room" --
+// everyone connected to the same name shares one Y.Doc. A branch is encoded
+// directly into that identity ("default@feature-x") rather than treated as a
+// per-connection parameter, because it has to be: two users can't
+// collaboratively co-edit two diverged branches as if they were the same
+// live document. Old-style plain docIds (no "@") default to "master", so
+// nothing that connected before this existed breaks.
+function parseDocumentName(documentName) {
+  const at = documentName.indexOf('@')
+  if (at === -1) return { docId: documentName, branch: 'master' }
+  return { docId: documentName.slice(0, at), branch: documentName.slice(at + 1) }
+}
 
 const httpApp = express()
 httpApp.use(cors())
@@ -82,7 +95,7 @@ async function checkpointToGit(documentName, entry) {
   // safe, because the individual chunks are now durable elsewhere.
   const changelog = entry.changelog.map((e) => JSON.stringify(e)).join('\n')
 
-  await saveSnapshot(documentName, ydocBytes, markdown, changelog, contributors)
+  await saveSnapshot(entry.docId, entry.branch, ydocBytes, markdown, changelog, contributors)
   entry.dirty = false
   entry.contributors.clear()
   entry.changelog = []
@@ -121,8 +134,11 @@ const hocuspocus = Server.configure({
   },
 
   onLoadDocument: async ({ documentName, document }) => {
+    const { docId, branch } = parseDocumentName(documentName)
     const entry = {
       document,
+      docId,
+      branch,
       dirty: false,
       contributors: new Set(['restored']),
       lastSavedStateVector: null,
@@ -152,7 +168,7 @@ const hocuspocus = Server.configure({
     }
 
     try {
-      const gitBytes = await loadSnapshot(documentName)
+      const gitBytes = await loadSnapshot(docId, branch)
       if (!gitBytes) return
       const doc = new Y.Doc()
       Y.applyUpdate(doc, gitBytes)

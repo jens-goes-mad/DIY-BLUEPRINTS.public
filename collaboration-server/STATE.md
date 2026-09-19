@@ -233,6 +233,51 @@ the same attribute to different values returned exactly one correctly-typed
 snapshot before and after — **master was left completely untouched** by
 the rejected merge attempt.
 
+### Branch-aware live editing, and the admin page
+
+Until now, `collab-server` only ever live-edited a single hardcoded branch
+(`master`, via a `BRANCH` env var) — branches existed only on the
+persistence side, never in the live Hocuspocus layer. A branch dropdown in
+the editor needed that to become real, not decorative.
+
+**The branch is encoded directly into the Hocuspocus document identity**
+(`docId@branch`, e.g. `default@feature-x`) rather than treated as a
+per-connection parameter, because it has to be: Hocuspocus's whole model is
+one shared `Y.Doc` per document name, and two people can't collaboratively
+co-edit two diverged branches as if they were the same live document.
+`server.js`'s `parseDocumentName` splits on `@`, defaulting to `master` for
+old-style plain docIds so nothing already connected breaks. This is also
+why the fast tier needed no changes at all: `documentName` (now the
+combined `docId@branch` string) was already its file-naming key, so
+different branches automatically get separate fast-tier storage for free.
+
+Switching branches in the UI is a full page navigation
+(`?branch=<name>`), not a live in-place swap — deliberate, not a shortcut:
+it gives a clean reconnect (new Hocuspocus room, fresh `onLoadDocument`)
+for free instead of needing to manually tear down and rebuild the
+Yjs doc/provider/editor triplet in place.
+
+**The admin page** (`admin.html`, linked from the editor) creates branches
+and merges them, using only the existing APIs — `GET`/`POST /api/branches`
+on `persistence-service` and `POST /api/documents/:docId/merge` on
+`collab-server` (the conflict-detecting one, not persistence-service's
+lower-level commit-only merge endpoint). A conflict response renders as a
+table (type, attribute, both sides' values) rather than raw JSON.
+
+This required one real backend addition: `persistence-service` had no CORS
+configuration at all, so the browser would have silently blocked every
+cross-origin call from the frontend (`:8090`) to `persistence-service`
+(`:8081`) even though `collab-server` (`:3000`) already had `cors()`
+enabled for the merge endpoint. Added a `CorsConfig` bean, verified via a
+real headless browser (not curl, which doesn't enforce or reveal CORS at
+all).
+
+**Building this surfaced the merge() data-loss incident below** — the
+branch dropdown loading empty content on its very first real exercise is
+what exposed it. Worth naming plainly: that bug predates this feature and
+would eventually have surfaced some other way, but it was this change that
+actually triggered and caught it.
+
 ## Verified and working
 
 - Realtime collaboration: TipTap + Yjs + Hocuspocus, multiple browser tabs,
@@ -265,6 +310,12 @@ the rejected merge attempt.
 - `git-frontend` (cgit): read-only, mounted `:ro` against the same repo
   volume — log, blame, diff, branch decorations, merge-commit parent links
   all confirmed rendering correctly against real data.
+- Branch-aware live editing (branch dropdown, page-navigation-based
+  switching) and the admin page (create branch, merge with conflict
+  display) — proven with a real headless browser: dropdown populates from
+  the real branch list with no CORS errors, switching branches loads that
+  branch's actual distinct content, and the admin page's create/merge
+  flows exercise the real APIs end-to-end.
 - Resilience: `onLoadDocument`/`onStoreDocument` wrapped so a
   persistence-service hiccup degrades gracefully instead of crashing
   `collab-server` (this happened for real once — see "Incidents" below —
@@ -277,12 +328,6 @@ the rejected merge attempt.
 - No table markdown-fidelity spike needed anymore — moot now that binary
   Yjs is the source of truth; the Markdown export's fidelity only affects
   how *readable* a diff is, never whether a feature works live.
-- No branch-switching UI in the actual editor — the branch/merge mechanism
-  is proven at the API/backend level (persistence-service endpoints,
-  exercised via direct calls and a test script) but `collab-server` has no
-  live "merge these two branches" HTTP trigger wired into normal operation
-  yet, and the frontend has no UI for picking a branch at all — still
-  hardcoded to `docId: "default"`, branch `master`.
 - Links, task lists, tables, images have native representations planned
   (markdown syntax exists for all of them) but aren't added as Tiptap
   extensions yet — StarterKit only.
@@ -301,3 +346,30 @@ the rejected merge attempt.
   can never crash the realtime server again, adding a process-level
   `unhandledRejection` handler as a last resort, and adding
   `restart: unless-stopped` to every service as a second safety net.
+
+- **2026-09-19**: `merge()`'s original implementation silently **deleted**
+  the live "default" document's entire content on the very first merge run
+  against a branch that had unrelated `save()` commits interleaved on it —
+  a real production-content-loss bug, not a test artifact. Root cause: it
+  used JGit's `MergeCommand` + `checkout()` + working-tree `git add` +
+  `commit --amend`, all of which read from/write to the git **index**. But
+  `save()` never touches the working tree or index at all (deliberate, for
+  concurrency — see "Branching and merging" above), so the index is
+  permanently stale the moment any `save()` runs. A later checkout-based
+  commit builds its tree from that stale index rather than the branch's
+  actual HEAD tree, silently **dropping** any file the index didn't know
+  about — including files completely unrelated to the docId being merged.
+  Traced precisely via git archaeology (`git log --full-history -- path`,
+  since default git log simplification was hiding the real picture): the
+  file existed with real content one commit before the first-ever merge,
+  and was gone immediately after, with no error anywhere. Content was
+  recoverable from git history (nothing already committed is ever lost —
+  only what a broken *later* commit could see), but the live branch tip
+  needed manual recovery. Fixed by rewriting `merge()` to use the exact
+  same pure object-database plumbing `save()` already used — never
+  touching the working tree at all eliminates the whole class of bug, not
+  just this instance of it. Covered by a permanent regression test
+  (`tests/integration/merge-with-conflict-detection.mjs`,
+  `testMergePreservesUnrelatedDocs`) that specifically merges one docId and
+  asserts an unrelated docId's snapshot is byte-identical before and after
+  — the exact shape of what broke.

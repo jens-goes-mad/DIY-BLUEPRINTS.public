@@ -7,19 +7,57 @@ import { HocuspocusProvider } from '@hocuspocus/provider'
 
 const HTTP_URL = import.meta.env.VITE_COLLAB_HTTP_URL || 'http://localhost:3000'
 const WS_URL = import.meta.env.VITE_COLLAB_WS_URL || 'ws://localhost:1234'
+const PERSISTENCE_URL = import.meta.env.VITE_PERSISTENCE_URL || 'http://localhost:8081'
 const DOC_ID = 'default'
 
 const CURSOR_COLORS = ['#f44336', '#2196f3', '#4caf50', '#ff9800', '#9c27b0', '#009688']
 
+function currentBranch() {
+  return new URLSearchParams(window.location.search).get('branch') || 'master'
+}
+
+async function populateBranchDropdown(branch) {
+  const select = document.getElementById('branch-select')
+  try {
+    const res = await fetch(`${PERSISTENCE_URL}/api/branches`)
+    const branches = await res.json()
+    if (!branches.includes(branch)) branches.push(branch)
+    select.innerHTML = ''
+    for (const b of branches.sort()) {
+      const option = document.createElement('option')
+      option.value = b
+      option.textContent = b
+      option.selected = b === branch
+      select.appendChild(option)
+    }
+  } catch (err) {
+    console.error('failed to load branch list:', err.message)
+    select.innerHTML = `<option value="${branch}" selected>${branch}</option>`
+  }
+
+  // A branch is a different live-editing "room" (see collab-server's
+  // parseDocumentName) -- switching means reconnecting from scratch, which
+  // a full navigation gives us for free, no manual teardown of the
+  // editor/provider needed.
+  select.addEventListener('change', () => {
+    const url = new URL(window.location.href)
+    url.searchParams.set('branch', select.value)
+    window.location.href = url.toString()
+  })
+}
+
 async function main() {
+  const branch = currentBranch()
+  await populateBranchDropdown(branch)
+
   const res = await fetch(`${HTTP_URL}/api/whoami`)
   const { userId } = await res.json()
-  document.getElementById('user-badge').textContent = `You are: ${userId}`
+  document.getElementById('user-badge').textContent = `You are: ${userId} — editing branch "${branch}"`
 
   const ydoc = new Y.Doc()
   const provider = new HocuspocusProvider({
     url: WS_URL,
-    name: DOC_ID,
+    name: `${DOC_ID}@${branch}`,
     document: ydoc,
     parameters: { userId },
   })

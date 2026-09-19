@@ -1,7 +1,7 @@
 const PERSISTENCE_URL = process.env.PERSISTENCE_URL || 'http://persistence-service:8080'
-const BRANCH = process.env.BRANCH || 'master'
+const DEFAULT_BRANCH = process.env.BRANCH || 'master'
 
-export async function loadSnapshot(docId, branch = BRANCH) {
+export async function loadSnapshot(docId, branch = DEFAULT_BRANCH) {
   const res = await fetch(`${PERSISTENCE_URL}/api/documents/${docId}?branch=${branch}`)
   if (!res.ok) throw new Error(`persistence-service load failed: ${res.status}`)
   const body = await res.json()
@@ -9,8 +9,8 @@ export async function loadSnapshot(docId, branch = BRANCH) {
   return Buffer.from(body.ydoc, 'base64')
 }
 
-export async function saveSnapshot(docId, ydocBytes, markdown, changelog, author) {
-  const res = await fetch(`${PERSISTENCE_URL}/api/documents/${docId}?branch=${BRANCH}`, {
+export async function saveSnapshot(docId, branch, ydocBytes, markdown, changelog, author) {
+  const res = await fetch(`${PERSISTENCE_URL}/api/documents/${docId}?branch=${branch}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
