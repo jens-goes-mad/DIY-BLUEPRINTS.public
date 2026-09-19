@@ -1,0 +1,60 @@
+import * as Y from 'yjs'
+import { yDocToProsemirrorJSON } from 'y-prosemirror'
+import { schema } from './schema.js'
+import { createMarkdownSerializer } from './markdown.js'
+import { loadSnapshot, findMergeBase, commitMerge } from './persistenceClient.js'
+import { detectConflicts } from './conflicts.js'
+
+const YJS_FIELD = 'default'
+const markdownSerializer = createMarkdownSerializer()
+
+function docFromBytes(bytes) {
+  const doc = new Y.Doc()
+  if (bytes) Y.applyUpdate(doc, bytes)
+  return doc
+}
+
+/**
+ * Either returns { merged: false, conflicts: [...] } without touching git
+ * at all, or performs the actual Yjs CRDT merge and commits it via
+ * persistence-service, returning { merged: true, commitId, parentCount }.
+ *
+ * The merge itself (Y.applyUpdate) would never fail or produce an
+ * ambiguous result even when detectConflicts finds something -- CRDT
+ * merges always converge deterministically (verified in
+ * tests/unit/merge-conflict-resolution.mjs). What conflicts here means is
+ * "this merge would silently resolve something in a way neither side
+ * would necessarily want" (last-writer-wins on a concurrently-changed
+ * attribute, or an edit landing on content the other branch deleted) --
+ * see conflicts.js for exactly what is and isn't detected.
+ */
+export async function mergeBranches(docId, sourceBranch, targetBranch, author) {
+  const mergeBaseCommit = await findMergeBase(sourceBranch, targetBranch)
+  if (!mergeBaseCommit) {
+    throw new Error(`branches share no common history: ${sourceBranch}, ${targetBranch}`)
+  }
+
+  const [baseBytes, targetBytes, sourceBytes] = await Promise.all([
+    loadSnapshot(docId, mergeBaseCommit),
+    loadSnapshot(docId, targetBranch),
+    loadSnapshot(docId, sourceBranch),
+  ])
+
+  const baseDoc = docFromBytes(baseBytes)
+  const targetDoc = docFromBytes(targetBytes)
+  const sourceDoc = docFromBytes(sourceBytes)
+
+  const conflicts = detectConflicts(baseDoc, targetDoc, sourceDoc, YJS_FIELD)
+  if (conflicts.length > 0) {
+    return { merged: false, conflicts }
+  }
+
+  Y.applyUpdate(targetDoc, Y.encodeStateAsUpdate(sourceDoc))
+  const mergedBytes = Y.encodeStateAsUpdate(targetDoc)
+  const docJSON = yDocToProsemirrorJSON(targetDoc, YJS_FIELD)
+  const node = schema.nodeFromJSON(docJSON)
+  const markdown = markdownSerializer.serialize(node)
+
+  const commitResult = await commitMerge(docId, targetBranch, sourceBranch, mergedBytes, markdown, author)
+  return { merged: true, ...commitResult }
+}

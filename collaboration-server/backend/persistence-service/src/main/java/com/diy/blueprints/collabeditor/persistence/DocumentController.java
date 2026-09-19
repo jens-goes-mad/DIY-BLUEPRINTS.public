@@ -59,6 +59,13 @@ public class DocumentController {
     return gitRepositoryService.listBranches();
   }
 
+  public record MergeBaseResponse(String commitId) {}
+
+  @GetMapping("/api/branches/merge-base")
+  public MergeBaseResponse mergeBase(@RequestParam String a, @RequestParam String b) throws Exception {
+    return new MergeBaseResponse(gitRepositoryService.findMergeBase(a, b));
+  }
+
   @PostMapping("/api/branches")
   public void createBranch(@RequestBody CreateBranchRequest request) throws Exception {
     gitRepositoryService.createBranch(request.newBranch(), request.fromBranch());

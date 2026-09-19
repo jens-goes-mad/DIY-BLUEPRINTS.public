@@ -11,6 +11,7 @@ import org.eclipse.jgit.lib.*;
 import org.eclipse.jgit.merge.MergeStrategy;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
+import org.eclipse.jgit.revwalk.filter.RevFilter;
 import org.eclipse.jgit.treewalk.TreeWalk;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -195,6 +196,27 @@ public class GitRepositoryService {
         throw new IllegalStateException("branch already exists: " + newBranch);
       }
       updateBranchRef(repo, newBranch, null, sourceId);
+    }
+  }
+
+  /**
+   * The commit both branches diverged from -- needed by collab-server to
+   * detect conflicts before merging (it decodes what each branch actually
+   * changed relative to this shared ancestor). Returns null if the
+   * branches share no history at all.
+   */
+  public String findMergeBase(String branchA, String branchB) throws IOException {
+    try (Repository repo = openRepo(); RevWalk revWalk = new RevWalk(repo)) {
+      ObjectId aId = repo.resolve(branchA);
+      ObjectId bId = repo.resolve(branchB);
+      if (aId == null || bId == null) {
+        throw new IllegalStateException("both branches must exist: " + branchA + ", " + branchB);
+      }
+      revWalk.setRevFilter(RevFilter.MERGE_BASE);
+      revWalk.markStart(revWalk.parseCommit(aId));
+      revWalk.markStart(revWalk.parseCommit(bId));
+      RevCommit mergeBase = revWalk.next();
+      return mergeBase == null ? null : mergeBase.getName();
     }
   }
 

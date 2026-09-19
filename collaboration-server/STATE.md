@@ -169,6 +169,70 @@ guessed-at design).
   end-to-end with real Yjs docs and confirmed rendering correctly in cgit
   (log, commit detail with both parent links, branch decorations).
 
+### Conflict detection before committing a merge
+
+`POST /api/documents/:docId/merge` on `collab-server` (`sourceBranch`,
+`targetBranch`, `author`) either returns `{merged: false, conflicts: [...]}`
+without touching git at all, or performs the merge and commits it, returning
+`{merged: true, commitId, parentCount}` — never both, never neither.
+
+**What "conflict" means here, precisely:** the CRDT merge itself *never*
+fails or produces an ambiguous result — that's proven in
+`tests/unit/merge-conflict-resolution.mjs` (order-independent, never
+throws, even across concurrent inserts/deletes/attribute writes). A
+"conflict" is not an algorithm failure; it's collab-server's own
+`conflicts.js` flagging that the merge *would* silently resolve something
+in a way neither side necessarily wanted — the two categories established
+in the branching RFC:
+
+1. **Attribute/formatting collisions** — both branches changed the *same*
+   node attribute (heading level, text-align, colspan, ...) to *different*
+   values since their common ancestor. Yjs resolves this via silent
+   last-writer-wins with zero trace of the loser.
+2. **Delete-vs-edit** — one branch deleted something the other branch
+   concurrently touched (edited, formatted, attached new content to).
+
+**How it's computed** (`GitRepositoryService.findMergeBase`, cross-checked
+directly against the real `git merge-base` binary — identical commit SHA):
+load the branches' common-ancestor snapshot plus each branch's own current
+snapshot, then compare.
+
+- Attribute conflicts are detected by walking the fully-**integrated**
+  base/target/source documents directly (matching nodes across all three
+  by their stable internal Yjs item id — identical across replicas for
+  anything created before the fork) and diffing attribute values, *not* by
+  decoding raw update bytes. That was tried first and found unreliable:
+  a raw decoded item's `parentSub`/`parent` fields are only populated for
+  the *first-ever* write to a key (verified directly) — overwriting an
+  *existing* value, the realistic conflict case, encodes as an
+  origin-chained item with both fields null instead.
+- A second, related trap caught along the way: overwriting an attribute
+  value internally tombstones the *old* value in Yjs's own DeleteSet as an
+  implementation detail of last-writer-wins (verified directly, and only
+  visible after realizing `JSON.stringify` silently renders any `Map` as
+  `{}` — it had been hiding the real DeleteSet contents in earlier
+  debugging). Without excluding those from the delete-vs-edit check, every
+  attribute conflict was double-counted as a phantom deletion too.
+- Delete-vs-edit conflicts *are* reliably detected from raw decoded update
+  bytes (an item's parent/origin/rightOrigin references are present
+  regardless), cross-referenced against the other side's DeleteSet.
+
+**Deliberately not covered:** two branches concurrently formatting the
+*same inline mark* (e.g. both toggling bold on overlapping text) without
+either side deleting anything. An inline mark's position is established
+via origin/rightOrigin chains within the surrounding text, not a stable
+parent+key pair, so robustly detecting "same range" needs more analysis
+than a single pass covers — left as a known gap rather than a guessed-at
+heuristic, documented in `conflicts.js` itself.
+
+**Verified end-to-end against the live stack**, both outcomes: a clean
+two-branch divergence (non-overlapping text edits) merged and committed
+with a real two-parent commit; a divergence where both branches changed
+the same attribute to different values returned exactly one correctly-typed
+`attribute` conflict, and — confirmed by comparing the branch tip's stored
+snapshot before and after — **master was left completely untouched** by
+the rejected merge attempt.
+
 ## Verified and working
 
 - Realtime collaboration: TipTap + Yjs + Hocuspocus, multiple browser tabs,
@@ -188,6 +252,11 @@ guessed-at design).
   the size-based safety net) firing correctly.
 - Git branch/merge mechanics, proven via a standalone JGit test and a full
   Node+real-Yjs end-to-end test against the live stack.
+- Pre-merge conflict detection (`POST /api/documents/:docId/merge`):
+  proven against the live stack both ways — a clean divergence merges and
+  commits with a real two-parent commit; a divergence with a genuine
+  attribute collision returns the conflict and leaves the target branch's
+  stored snapshot provably untouched (compared byte-for-byte before/after).
 - Per-edit changelog (`<docId>.changelog.jsonl`, committed alongside the
   snapshot): proven by replaying a single commit's changelog onto the
   *previous* commit's snapshot and getting a byte-identical Yjs state

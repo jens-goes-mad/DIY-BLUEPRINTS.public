@@ -1,0 +1,14 @@
+{
+  "name": "collaboration-server-tests",
+  "private": true,
+  "comment": "Root-level, host-side-testing-only manifest. Each Docker image installs its own real dependencies independently at build time (see backend/*/package.json) -- this exists purely so every test under tests/ resolves shared packages like yjs to a SINGLE copy, which matters: two separate yjs instances break its internal instanceof checks (https://github.com/yjs/yjs/issues/438).",
+  "devDependencies": {
+    "yjs": "^13.6.18",
+    "@hocuspocus/provider": "^2.13.5",
+    "ws": "^8.18.0",
+    "@tiptap/core": "^2.5.9",
+    "@tiptap/starter-kit": "^2.5.9",
+    "prosemirror-markdown": "^1.13.1",
+    "markdown-it": "^14.1.0"
+  }
+}

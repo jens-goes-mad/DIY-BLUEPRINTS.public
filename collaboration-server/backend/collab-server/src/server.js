@@ -7,6 +7,7 @@ import { schema } from './schema.js'
 import { createMarkdownSerializer } from './markdown.js'
 import { loadSnapshot, saveSnapshot } from './persistenceClient.js'
 import { loadLocal, appendDelta, compact, COMPACT_LOG_BYTES } from './localStore.js'
+import { mergeBranches } from './mergeBranches.js'
 
 const WS_PORT = process.env.WS_PORT || 1234
 const HTTP_PORT = process.env.HTTP_PORT || 3000
@@ -33,6 +34,7 @@ const liveDocuments = new Map()
 
 const httpApp = express()
 httpApp.use(cors())
+httpApp.use(express.json())
 
 httpApp.get('/api/whoami', (req, res) => {
   userCounter += 1
@@ -41,6 +43,25 @@ httpApp.get('/api/whoami', (req, res) => {
 
 httpApp.get('/api/health', (req, res) => {
   res.json({ status: 'ok' })
+})
+
+// Returns { merged: false, conflicts: [...] } without touching git if
+// detectConflicts finds anything (see conflicts.js for exactly what
+// counts); otherwise performs the CRDT merge and commits it, returning
+// { merged: true, commitId, parentCount }.
+httpApp.post('/api/documents/:docId/merge', async (req, res) => {
+  const { docId } = req.params
+  const { sourceBranch, targetBranch, author } = req.body
+  if (!sourceBranch || !targetBranch) {
+    return res.status(400).json({ error: 'sourceBranch and targetBranch are required' })
+  }
+  try {
+    const result = await mergeBranches(docId, sourceBranch, targetBranch, author || 'unknown')
+    res.json(result)
+  } catch (err) {
+    console.error(`[merge] failed for "${docId}" (${sourceBranch} -> ${targetBranch}):`, err.message)
+    res.status(500).json({ error: err.message })
+  }
 })
 
 httpApp.listen(HTTP_PORT, () => {
