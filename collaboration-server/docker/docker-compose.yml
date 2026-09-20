@@ -4,7 +4,7 @@ services:
     build:
       context: ../frontend
     ports:
-      - "8090:80"
+      - "8085:80"
     depends_on:
       - collab-server
 
@@ -20,8 +20,18 @@ services:
       - HTTP_PORT=3000
       - LIVE_STORE_PATH=/data/live
       - GIT_CHECKPOINT_INTERVAL_MS=60000
+      # Artifact Keeper: internal (docker-network) URL for uploads vs. the
+      # published host port for the download URLs handed to the browser --
+      # see artifactKeeperClient.js. Credential is server-side only.
+      - ARTIFACT_KEEPER_URL=http://artifact-keeper:8080
+      - ARTIFACT_KEEPER_PUBLIC_URL=http://localhost:8082
+      - ARTIFACT_KEEPER_USERNAME=admin
+      - ARTIFACT_KEEPER_PASSWORD=AkPrototype2026NotForProd!
+      - ARTIFACT_KEEPER_REPO=editor-assets
     volumes:
       - live-data:/data/live
+    depends_on:
+      - artifact-keeper
 
   persistence-service:
     restart: unless-stopped
@@ -43,20 +53,156 @@ services:
     depends_on:
       - persistence-service
 
-  minio:
-    restart: unless-stopped
-    image: quay.io/minio/minio:latest
-    command: server /data --console-address ":9001"
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+  # ---------------------------------------------------------------------------
+  # Artifact Keeper (image/binary storage for the editor)
+  # ---------------------------------------------------------------------------
+  # Trimmed from upstream's getting-started compose file (artifact-keeper/
+  # artifact-keeper on GitHub) to just what the backend hard-depends on to
+  # boot: postgres + opensearch. Deliberately dropped: Trivy/OpenSCAP/
+  # Dependency-Track (vulnerability/SBOM scanning -- irrelevant to storing an
+  # inserted image), the Next.js web UI, and Caddy (its only job upstream is
+  # TLS termination + routing web/backend behind one port; we don't need
+  # either for a local prototype, so backend is published directly instead).
+  # No auth hardening for this prototype (see STATE.md) -- ADMIN_PASSWORD is
+  # a known fixed value so setup can be scripted; real auth (Keycloak) is a
+  # later, separate concern.
+  ak-pg-certs:
+    image: alpine:3.24
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ -f /certs/server.crt ]; then
+          echo "pg-certs: certificates already exist, skipping"
+          exit 0
+        fi
+        apk add --no-cache openssl >/dev/null 2>&1
+        openssl genrsa -out /certs/ca.key 4096
+        openssl req -x509 -new -nodes -key /certs/ca.key -sha256 -days 365 \
+          -out /certs/ca.crt -subj "/CN=Artifact Keeper CA/O=Artifact Keeper/C=US"
+        openssl genrsa -out /certs/server.key 2048
+        openssl req -new -key /certs/server.key \
+          -out /certs/server.csr -subj "/CN=postgres/O=Artifact Keeper/C=US"
+        cat > /certs/server.ext <<EOF
+        authorityKeyIdentifier=keyid,issuer
+        basicConstraints=CA:FALSE
+        keyUsage=digitalSignature,nonRepudiation,keyEncipherment,dataEncipherment
+        subjectAltName=DNS:localhost,DNS:ak-postgres,IP:127.0.0.1
+        EOF
+        openssl x509 -req -in /certs/server.csr -CA /certs/ca.crt -CAkey /certs/ca.key \
+          -CAcreateserial -out /certs/server.crt -days 365 -sha256 -extfile /certs/server.ext
+        rm -f /certs/server.csr /certs/server.ext /certs/ca.srl
+        chown 70:70 /certs/server.key /certs/server.crt /certs/ca.crt
+        chmod 600 /certs/server.key
+        chmod 644 /certs/server.crt /certs/ca.crt
     volumes:
-      - minio-data:/data
+      - ak-pg-certs:/certs
+    restart: "no"
+
+  ak-postgres:
+    image: postgres:18-alpine
+    depends_on:
+      ak-pg-certs:
+        condition: service_completed_successfully
     environment:
-      - MINIO_ROOT_USER=devuser
-      - MINIO_ROOT_PASSWORD=devpassword
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+    volumes:
+      - ak-postgres-data:/var/lib/postgresql
+      - ./artifact-keeper/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+      - ./artifact-keeper/init-pg-ssl.sh:/docker-entrypoint-initdb.d/init-pg-ssl.sh:ro
+      - ak-pg-certs:/var/lib/postgresql/certs:ro
+    ports:
+      - "30432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  ak-scan-workspace-init:
+    image: alpine:3.24
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /scan-workspace
+        chown -R 1001:0 /scan-workspace
+        chmod 0775 /scan-workspace
+    volumes:
+      - ak-scan-workspace:/scan-workspace
+    restart: "no"
+    healthcheck:
+      disable: true
+
+  ak-opensearch:
+    image: opensearchproject/opensearch:2.19.6
+    environment:
+      discovery.type: single-node
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+    volumes:
+      - ak-opensearch-data:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  artifact-keeper:
+    image: ghcr.io/artifact-keeper/artifact-keeper-backend:latest
+    depends_on:
+      ak-postgres:
+        condition: service_healthy
+      ak-opensearch:
+        condition: service_healthy
+      ak-scan-workspace-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://registry:registry@ak-postgres:5432/artifact_registry?sslmode=require
+      STORAGE_PATH: /data/storage
+      BACKUP_PATH: /data/backups
+      PLUGINS_DIR: /data/plugins
+      ADMIN_PASSWORD: admin
+      # Real random secret required (the backend rejects known placeholder
+      # strings even for a prototype -- it signs auth tokens, not a
+      # user-facing login). No other auth hardening is done here; Keycloak
+      # is the planned real-auth story later.
+      JWT_SECRET: NDC0f65A46tufRXahXUqBP35N1svqZg0KX375+6m4N4fHHWaxYx+3/+CbO0vRj/O
+      ENVIRONMENT: development
+      OPENSEARCH_URL: http://ak-opensearch:9200
+      SCAN_WORKSPACE_PATH: /scan-workspace
+      ALLOW_HTTP_INTEGRATIONS: "1"
+      HOST: 0.0.0.0
+      PORT: 8080
+    volumes:
+      - ak-artifact-storage:/data/storage
+      - ak-backup-storage:/data/backups
+      - ak-plugins-storage:/data/plugins
+      - ak-scan-workspace:/scan-workspace
+    ports:
+      - "8082:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/livez"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
 
 volumes:
   repo-data:
   live-data:
-  minio-data:
+  ak-pg-certs:
+  ak-postgres-data:
+  ak-scan-workspace:
+  ak-opensearch-data:
+  ak-artifact-storage:
+  ak-backup-storage:
+  ak-plugins-storage:

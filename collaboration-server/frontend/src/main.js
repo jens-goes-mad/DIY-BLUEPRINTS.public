@@ -2,6 +2,7 @@ import { Editor } from '@tiptap/core'
 import StarterKit from '@tiptap/starter-kit'
 import Collaboration from '@tiptap/extension-collaboration'
 import CollaborationCursor from '@tiptap/extension-collaboration-cursor'
+import Image from '@tiptap/extension-image'
 import * as Y from 'yjs'
 import { HocuspocusProvider } from '@hocuspocus/provider'
 
@@ -46,6 +47,24 @@ async function populateBranchDropdown(branch) {
   })
 }
 
+// Uploads to collab-server, which proxies to Artifact Keeper server-side
+// (the admin credential never reaches the browser) and hands back a public,
+// anonymously-downloadable URL -- that URL string is the only thing that
+// ends up in the document. The image itself never touches Yjs or git.
+async function uploadImage(file) {
+  const res = await fetch(`${HTTP_URL}/api/upload`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': file.type || 'application/octet-stream',
+      'X-Filename': file.name,
+    },
+    body: file,
+  })
+  if (!res.ok) throw new Error(`upload failed: HTTP ${res.status}`)
+  const body = await res.json()
+  return body.url
+}
+
 async function main() {
   const branch = currentBranch()
   await populateBranchDropdown(branch)
@@ -76,9 +95,47 @@ async function main() {
         provider,
         user: { name: userId, color },
       }),
+      // allowBase64 stays at its default (false): dropped images must go
+      // through uploadImage and become a URL reference, never inline binary
+      // in the document -- see STATE.md.
+      Image,
     ],
     onTransaction: () => updateToolbarState(editor),
     onSelectionUpdate: () => updateToolbarState(editor),
+    editorProps: {
+      // Drag-and-drop is the intuitive path for inserting images (vs. a
+      // toolbar button/URL prompt) -- intercept it here, before TipTap's
+      // default drop handling, upload the file, then insert an image node
+      // referencing the uploaded URL once the upload resolves.
+      handleDrop(view, event, _slice, moved) {
+        if (moved) return false // internal drag-reorder within the doc, not a file drop
+        const files = Array.from(event.dataTransfer?.files || []).filter((f) => f.type.startsWith('image/'))
+        if (files.length === 0) return false
+
+        event.preventDefault()
+        const coords = view.posAtCoords({ left: event.clientX, top: event.clientY })
+        const pos = coords ? coords.pos : view.state.selection.from
+
+        // Move the cursor to the drop position synchronously, before the
+        // upload's async gap. Uploading takes real time (server round trip
+        // to Artifact Keeper); inserting at a position captured before that
+        // gap risks it having drifted from further edits/doc growth in the
+        // meantime (verified directly -- a stale position landed the image
+        // inside an unrelated existing node instead of at the drop point).
+        // Inserting at the *current* selection when the upload resolves,
+        // via TipTap's own setImage command, sidesteps that entirely.
+        editor.chain().focus().setTextSelection(pos).run()
+
+        for (const file of files) {
+          uploadImage(file)
+            .then((url) => {
+              editor.chain().focus().setImage({ src: url, alt: file.name }).run()
+            })
+            .catch((err) => console.error('image upload failed:', err.message))
+        }
+        return true
+      },
+    },
   })
 
   buildToolbar(editor)

@@ -3,7 +3,7 @@
 Kept up to date as the project evolves. This is the detailed "what's
 actually true right now" doc — README.md is just the quick-start pointer.
 
-Last updated: 2026-09-19.
+Last updated: 2026-09-20.
 
 ## Architecture
 
@@ -216,6 +216,17 @@ snapshot, then compare.
 - Delete-vs-edit conflicts *are* reliably detected from raw decoded update
   bytes (an item's parent/origin/rightOrigin references are present
   regardless), cross-referenced against the other side's DeleteSet.
+- A third false positive, found from real usage rather than a test (see
+  the 2026-09-20 incident below): a document's *own prior editing
+  history* — content typed and deleted long before either branch
+  existed, completely ordinary — still shows up in a from-base-vector
+  delta, because Yjs re-signals any deletion the receiving vector
+  predates. An unrelated edit whose origin/rightOrigin happened to chain
+  near that long-dead position was getting flagged as touching a
+  deletion that, from either branch's perspective, never happened. Fixed
+  by excluding anything already present in the merge-base's *own*
+  DeleteSet from counting as a "new" deletion by either side. Covered by
+  `tests/unit/conflict-detection.mjs` Case 5.
 
 **Deliberately not covered:** two branches concurrently formatting the
 *same inline mark* (e.g. both toggling bold on overlapping text) without
@@ -266,7 +277,7 @@ table (type, attribute, both sides' values) rather than raw JSON.
 
 This required one real backend addition: `persistence-service` had no CORS
 configuration at all, so the browser would have silently blocked every
-cross-origin call from the frontend (`:8090`) to `persistence-service`
+cross-origin call from the frontend (`:8085`) to `persistence-service`
 (`:8081`) even though `collab-server` (`:3000`) already had `cors()`
 enabled for the merge endpoint. Added a `CorsConfig` bean, verified via a
 real headless browser (not curl, which doesn't enforce or reveal CORS at
@@ -277,6 +288,63 @@ branch dropdown loading empty content on its very first real exercise is
 what exposed it. Worth naming plainly: that bug predates this feature and
 would eventually have surfaced some other way, but it was this change that
 actually triggered and caught it.
+
+### Image upload (drag-and-drop → Artifact Keeper)
+
+**Goal, per the RFC that shaped this:** store images/binaries outside git
+entirely and keep only a read-only *reference* (a URL) in the document.
+Editing an inserted image's pixels in place was never a requirement — a
+TipTap `Image` node is already an atom node the user can't edit inline, so
+no locking mechanism was needed beyond that. Drag-and-drop is the only
+insertion path built (no toolbar button/URL-prompt), per explicit scope.
+
+**Storage backend: [Artifact Keeper](https://github.com/artifact-keeper/artifact-keeper)**,
+an open-source self-hostable artifact registry, chosen over building a raw
+object-store integration from scratch. Deployed trimmed to just what its
+backend hard-depends on to boot — Postgres (with self-signed TLS, the
+backend requires `sslmode=require`) + OpenSearch (`DISABLE_SECURITY_PLUGIN`)
+— dropping the upstream getting-started compose's Trivy/OpenSCAP/
+Dependency-Track scanners, the Next.js web UI, and Caddy (irrelevant to
+storing an inserted image; direct port publishing replaces Caddy's routing
+role for a local prototype). No auth hardening beyond what the backend
+itself refuses to skip (see incidents below) — real auth (Keycloak) is a
+later, separate concern, per explicit instruction for this prototype.
+
+**Data flow:** `frontend/src/main.js`'s `editorProps.handleDrop` intercepts
+TipTap's drop handling before its default runs, filters to image files,
+and — because the upload is a real async round trip — sets the editor's
+**text selection** synchronously at drop time
+(`editor.chain().focus().setTextSelection(pos).run()`) rather than holding
+onto the raw captured `pos` across the `await`. Verified directly why this
+matters: a raw position captured before the async gap can drift (further
+edits, doc growth) and lands the image in the wrong place or silently
+nowhere. Once the upload resolves, TipTap's own `setImage({src, alt})`
+command inserts at the *current* selection, sidestepping the staleness
+entirely. The browser never talks to Artifact Keeper directly — it POSTs
+raw bytes to `collab-server`'s `/api/upload`, which holds the admin
+credential server-side (`artifactKeeperClient.js`) and returns a public,
+anonymously-downloadable URL. That URL string is the only thing that ever
+enters the Yjs document; the image bytes never touch Yjs or git.
+
+**Repository setup:** a single `editor-assets` generic repository, created
+`is_public: true` + `allow_anonymous_access: true` via a follow-up `PATCH`
+(the real field names — a guessed `"public": true` on creation is silently
+ignored) so a plain `<img src>` can fetch it with no auth header at all
+(essential: `<img>` tags can't send an `Authorization` header).
+
+**Token handling:** `artifactKeeperClient.js` caches the access token
+(`expires_in`, 60s safety margin) rather than logging in fresh per upload —
+Artifact Keeper rate-limits its login endpoint, and a real user dragging a
+few images into one session would otherwise risk tripping it. A 401 *or*
+403 on the actual upload triggers exactly one forced-fresh-login retry
+before giving up (403's reason: see incident below).
+
+**Verified end-to-end** via a real headless-browser test (Playwright,
+simulated OS-level drag/drop event sequence onto a live `.ProseMirror`
+element, not a synthetic transaction): the `<img>` element lands in the
+DOM with a `src` pointing at Artifact Keeper, that URL resolves with no
+auth header (`200`), and the returned bytes are byte-identical to the
+dropped file.
 
 ## Verified and working
 
@@ -321,16 +389,18 @@ actually triggered and caught it.
   `collab-server` (this happened for real once — see "Incidents" below —
   and is now fixed and covered by a process-level `unhandledRejection`
   handler as a last resort). Every service has `restart: unless-stopped`.
+- Image upload (drag-and-drop → Artifact Keeper → read-only URL reference
+  in the document): proven end-to-end with a real headless-browser
+  simulated drop — see "Image upload" above.
 
 ## Not done yet
 
-- No image/asset upload wired to MinIO (MinIO container exists, unused).
 - No table markdown-fidelity spike needed anymore — moot now that binary
   Yjs is the source of truth; the Markdown export's fidelity only affects
   how *readable* a diff is, never whether a feature works live.
-- Links, task lists, tables, images have native representations planned
-  (markdown syntax exists for all of them) but aren't added as Tiptap
-  extensions yet — StarterKit only.
+- Links, task lists, tables have native representations planned (markdown
+  syntax exists for all of them) but aren't added as Tiptap extensions yet
+  — StarterKit only, plus `Image` (see "Image upload" above).
 
 ## Incidents (for context on why some guardrails exist)
 
@@ -373,3 +443,41 @@ actually triggered and caught it.
   `testMergePreservesUnrelatedDocs`) that specifically merges one docId and
   asserts an unrelated docId's snapshot is byte-identical before and after
   — the exact shape of what broke.
+
+- **2026-09-20**: a real user-created branch (`feature-test-001`, a
+  genuine one-word wording change on an otherwise-untouched sentence)
+  could not be merged — every attempt returned a `delete-vs-edit`
+  conflict, reproducibly, reload or not. Traced by decoding the actual
+  branches' real data with the real `conflicts.js`: the flagged target ID
+  was already a garbage-collected placeholder in the merge-base itself,
+  and the merge-base's own DeleteSet already contained that exact
+  deletion — ordinary prior editing history (something typed and deleted
+  long before this branch existed), not anything either branch did. See
+  "Conflict detection" above for the fix. This is the same false-positive
+  *class* as the attribute-overwrite-tombstone issue found while first
+  building `conflicts.js` — a reminder that this detector inherently
+  works by walking Yjs's low-level CRDT structures directly rather than
+  through an API designed to answer "is this new," so new categories of
+  "technically in the delta, not actually a new conflict" are the
+  expected shape of future bugs here, not a one-off.
+
+- **2026-09-20**: Artifact Keeper uploads started failing with a `403` from
+  `collab-server` (distinct from an earlier, separately-fixed `429` —
+  see the token-caching note above) *after* a container restart, even
+  though login with the already-set password kept succeeding (`200`, valid
+  token). Traced directly: restarting `artifact-keeper` flips its built-in
+  admin account's `must_change_password` flag back to `true`, which gates
+  **every** authenticated endpoint with `403 SETUP_REQUIRED` — confirmed by
+  finding even the public, anonymous-access download URL 403ing site-wide,
+  not just the upload path. Re-submitting the password-change endpoint with
+  the *same* password (no actual credential change) immediately unlocked
+  the entire API again. Root cause is presumably the compose file's fixed
+  `ADMIN_PASSWORD: admin` env var re-arming provisioning on every boot
+  without literally resetting the password value. Fixed properly, not as a
+  one-off manual unlock: `artifactKeeperClient.js`'s `login()` now checks
+  `must_change_password` on every login response and re-confirms the
+  password automatically if set; the upload retry path also treats a `403`
+  the same as a `401` (one forced-fresh-login retry) in case the flag flips
+  while a cached token is still otherwise valid. Means any future
+  `artifact-keeper` restart self-heals instead of silently breaking uploads
+  until someone notices and manually curls the unlock.

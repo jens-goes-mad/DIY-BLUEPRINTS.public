@@ -8,6 +8,7 @@ import { createMarkdownSerializer } from './markdown.js'
 import { loadSnapshot, saveSnapshot } from './persistenceClient.js'
 import { loadLocal, appendDelta, compact, COMPACT_LOG_BYTES } from './localStore.js'
 import { mergeBranches } from './mergeBranches.js'
+import { uploadAsset } from './artifactKeeperClient.js'
 
 const WS_PORT = process.env.WS_PORT || 1234
 const HTTP_PORT = process.env.HTTP_PORT || 3000
@@ -56,6 +57,23 @@ httpApp.get('/api/whoami', (req, res) => {
 
 httpApp.get('/api/health', (req, res) => {
   res.json({ status: 'ok' })
+})
+
+// The image/binary itself never touches Yjs or git (see STATE.md) -- the
+// browser posts raw bytes here, this proxies the upload to Artifact Keeper
+// (keeping its admin credential server-side, never exposed to the browser),
+// and returns a public, anonymously-downloadable URL. Only that URL string
+// ends up in the document, via TipTap's Image node (src/alt/title only).
+httpApp.post('/api/upload', express.raw({ type: '*/*', limit: '25mb' }), async (req, res) => {
+  const filename = req.header('X-Filename') || 'upload.bin'
+  const contentType = req.header('Content-Type') || 'application/octet-stream'
+  try {
+    const url = await uploadAsset(filename, req.body, contentType)
+    res.json({ url })
+  } catch (err) {
+    console.error(`[upload] failed for "${filename}":`, err.message)
+    res.status(500).json({ error: err.message })
+  }
 })
 
 // Returns { merged: false, conflicts: [...] } without touching git if

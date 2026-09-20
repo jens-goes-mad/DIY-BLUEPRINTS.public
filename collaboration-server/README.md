@@ -15,7 +15,7 @@ cd docker
 docker compose up -d --build
 ```
 
-Then open **http://localhost:8090** in a couple of browser tabs — each one
+Then open **http://localhost:8085** in a couple of browser tabs — each one
 gets assigned `User-N` and edits are synced live between them, including
 remote cursors.
 
@@ -23,11 +23,11 @@ remote cursors.
 
 | Service | Port | What it is |
 |---|---|---|
-| `frontend` | 8090 | The TipTap editor (static, nginx) |
+| `frontend` | 8085 | The TipTap editor (static, nginx) |
 | `collab-server` | 1234 (ws), 3000 (http) | Node/Hocuspocus — realtime Yjs sync, `/api/whoami` |
 | `persistence-service` | 8081 | Spring Boot + JGit — git-backed snapshot storage, branch/merge |
 | `git-frontend` | 8096 | cgit — read-only browser for the persisted git history |
-| `minio` | 9000 (api), 9001 (console) | Object storage, reserved for future image/asset uploads |
+| `artifact-keeper` | 8082 | Image/binary storage for dropped-in images (drag-and-drop → uploaded → read-only URL reference in the document) |
 
 ## The core design decision
 

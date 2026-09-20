@@ -22,7 +22,17 @@ import * as Y from 'yjs'
 //
 // Delete-vs-edit conflicts, by contrast, ARE reliably detectable from raw
 // decoded update bytes: an inserted/formatted item's parent/origin/
-// rightOrigin references are present in the encoding regardless.
+// rightOrigin references are present in the encoding regardless. Two things
+// have to be excluded from "deleted" for this to only flag real conflicts
+// (both verified against real false positives, not hypothesized):
+// attribute-overwrite tombstones (see collectAttributeValueItemIds), and
+// deletions that already existed in the common ancestor itself -- ordinary
+// "typed something, deleted it" editing history from before either branch
+// existed, which still shows up in a from-vector delta because Yjs
+// re-signals any deletion the receiving vector predates. Without excluding
+// it, a totally unrelated edit whose origin/rightOrigin happens to
+// origin-chain near that long-dead position gets flagged as touching a
+// deletion that, from either branch's perspective, never happened.
 //
 // Deliberately NOT covered: two branches concurrently formatting the same
 // inline mark (e.g. both toggling bold on overlapping text) without either
@@ -101,9 +111,8 @@ function collectAttributeValueItemIds(decodedSources) {
   return ids
 }
 
-function isInRanges(id, ranges, excludeIds) {
+function isInRanges(id, ranges) {
   if (!id || typeof id.client !== 'number') return false
-  if (excludeIds.has(`${id.client}:${id.clock}`)) return false
   return ranges.some((r) => r.client === id.client && id.clock >= r.start && id.clock < r.end)
 }
 
@@ -116,12 +125,25 @@ function detectDeleteTouchConflicts(baseDoc, docA, docB) {
   const deletedByB = deletedRanges(decodedB)
   const attributeValueIds = collectAttributeValueItemIds([decodedBase, decodedA, decodedB])
 
+  // Anything already deleted in the common ancestor isn't a "new" deletion
+  // by either branch -- it's shared history. Without this, a delta that
+  // merely re-signals old, already-known deletions (Yjs does this whenever
+  // the receiving state vector predates them) gets misread as "this branch
+  // just deleted something," and an unrelated edit whose origin/rightOrigin
+  // happens to chain near that long-dead position gets flagged as touching
+  // a deletion that, from either branch's perspective, never happened.
+  // Verified directly against a real false positive this produced.
+  const preExistingDeletes = deletedRanges(decodedBase)
+
+  const isNewDeletion = (ref, ranges) =>
+    isInRanges(ref, ranges) && !isInRanges(ref, preExistingDeletes) && !attributeValueIds.has(`${ref.client}:${ref.clock}`)
+
   const seen = new Set()
   const conflicts = []
   const check = (structs, ranges, deletedBySide, editedBySide) => {
     for (const item of structs) {
       for (const ref of [item.parent, item.origin, item.rightOrigin]) {
-        if (isInRanges(ref, ranges, attributeValueIds)) {
+        if (isNewDeletion(ref, ranges)) {
           const key = `${deletedBySide}:${ref.client}:${ref.clock}`
           if (seen.has(key)) continue
           seen.add(key)
