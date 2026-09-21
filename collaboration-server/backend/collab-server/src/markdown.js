@@ -58,6 +58,10 @@ export function createMarkdownSerializer() {
         }
       }
     },
+    image(state, node) {
+      state.write('![' + state.esc(node.attrs.alt || '') + '](' + state.esc(node.attrs.src) +
+        (node.attrs.title ? ' ' + state.quote(node.attrs.title) : '') + ')')
+    },
     text(state, node) {
       state.text(node.text, !state.inAutolink)
     },
