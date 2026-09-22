@@ -346,6 +346,153 @@ DOM with a `src` pointing at Artifact Keeper, that URL resolves with no
 auth header (`200`), and the returned bytes are byte-identical to the
 dropped file.
 
+## RFC: multi-tenant scale (agreed direction, not yet built)
+
+**The question this answers:** the current model is one shared git repo
+(`repo-data`, no customer/tenant concept at all) with a flat `docId@branch`
+namespace. That's fine for a single-customer prototype, but doesn't hold up
+at "hundreds of customers, each with hundreds of documents, in different
+languages and branches" — specifically for *querying*: "show me all
+branches for customer X," "show docs for customer X," "show the branches
+of doc Y." Git has no secondary indexes; answering these from raw git
+alone means linear-scanning ref names against some naming convention, which
+doesn't extend to real filtering (by language, recency, etc.) and gets
+slower as the ref count grows across every tenant sharing one repo.
+
+**Decision: keep git as a pure content-addressable snapshot/history store
+(same separation of concerns as "What's actually stored in git, and why"
+above), and add a real Postgres index that `persistence-service` maintains
+alongside every git write.** Git remains authoritative for document
+content and history; Postgres exists purely to make "show me X" queries
+fast and expressive, and is treated as a rebuildable cache of what git
+already contains — never the other way around.
+
+**Repo topology: one bare-in-spirit git repo per customer** (technically
+non-bare on disk like today's single repo, but never checked out — see
+below), sharded on disk to avoid one flat directory at scale:
+`/data/repos/<customerId[0:2]>/<customerId>.git`. None of the example
+queries cross a customer boundary, so per-customer repos give free tenant
+isolation (natural access-control boundary, independent backup/restore,
+no risk of one customer's ref namespace colliding with another's) at the
+cost of operating hundreds of repos instead of one — the same shape
+GitHub/GitLab already solve, and for the same reason: they don't query raw
+git refs for their own UI either, they maintain their own DB index over
+git and use git purely for object storage.
+
+**Document identity includes language**: `("onboarding-guide", "en")` and
+`("onboarding-guide", "de")` are two independent documents with
+independent branch histories, not two branches of one document — they're
+not realistic merge candidates of each other. (Flagged as the biggest
+assumption in this design; revisit if translation workflows turn out to
+need shared history between language variants.)
+
+**Branch ref naming stays self-describing**, not just index-dependent:
+`refs/heads/docs/<docId>/<language>/<branchName>` — so "all branches of a
+doc" is still answerable directly from git as a defense-in-depth check
+against the index (see consistency note below), not solely from Postgres.
+
+### Postgres schema
+
+```sql
+CREATE TABLE customers (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  slug         TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL,
+  repo_path    TEXT NOT NULL UNIQUE,   -- /data/repos/ab/<id>.git
+  status       TEXT NOT NULL DEFAULT 'provisioning', -- provisioning | ready | archived
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE documents (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  customer_id UUID NOT NULL REFERENCES customers(id),
+  doc_id      TEXT NOT NULL,           -- stable slug, e.g. "onboarding-guide"
+  language    TEXT NOT NULL,           -- BCP-47, e.g. "en", "de", "fr-CA"
+  title       TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (customer_id, doc_id, language)
+);
+
+CREATE TABLE branches (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  document_id     UUID NOT NULL REFERENCES documents(id),
+  branch_name     TEXT NOT NULL,       -- leaf name, e.g. "review-q3"
+  git_ref         TEXT NOT NULL,       -- refs/heads/docs/onboarding-guide/en/review-q3
+  is_default      BOOLEAN NOT NULL DEFAULT false,
+  head_commit_sha TEXT,                -- kept in sync by persistence-service after every write
+  created_by      TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (document_id, branch_name)
+);
+
+CREATE INDEX idx_documents_customer ON documents(customer_id);
+CREATE INDEX idx_documents_language ON documents(customer_id, language);
+CREATE INDEX idx_branches_document  ON branches(document_id);
+```
+
+This directly answers the three motivating queries as plain joins, no
+ref-name parsing at query time: branches for a customer is
+`branches JOIN documents … WHERE customer_id = ?`; docs for a customer is
+`documents WHERE customer_id = ? [AND language = ?]`; branches of a doc is
+`branches WHERE document_id = ?`.
+
+### New API surface (on `persistence-service`)
+
+- **Customer/repo lifecycle**: `createCustomer(slug, displayName)` — this
+  is the `createRepo(Customer)` from the original ask, folded into one
+  call rather than split in two: inserts the row as `provisioning`,
+  `git init`s the repo at the computed sharded path, flips to `ready`. A
+  two-phase status column instead of a separate call means a crash
+  mid-provisioning is visible and retryable rather than silently
+  inconsistent. Plus `getCustomer`, `listCustomers(filter?)`,
+  `archiveCustomer` (soft-delete only — hard repo deletion stays a
+  separate, explicitly-confirmed operation, same caution as the 2026-09-22
+  volume wipe below).
+- **Document lifecycle**: `createDocument(customerId, docId, language,
+  title)` — index row plus seeds the `master` branch (ref + empty
+  snapshot + `is_default=true` row). Plus `listDocuments(customerId,
+  {language?})`, `getDocument(customerId, docId, language)`.
+- **Branch lifecycle**: `createBranch(customerId, docId, language,
+  branchName, fromBranch = 'master')`, `listBranches(customerId, {docId?,
+  language?})` (the general-purpose query behind all three motivating
+  lookups), `deleteBranch(...)` (we have no equivalent of this today at
+  all — the 2026-09-22 "reset everything" request had to fall back to a
+  full Docker volume wipe because no branch-delete API existed), and
+  `mergeBranch(customerId, docId, language, source, target, author)` —
+  same conflict logic `conflicts.js` already has, scoped to the customer's
+  repo.
+- **Content**: `loadSnapshot`/`saveSnapshot` adapt today's versions by
+  resolving `customers.repo_path` first; `saveSnapshot` additionally
+  updates `branches.head_commit_sha` and `documents.updated_at` after the
+  git write succeeds.
+
+### Consistency caveat
+
+Git and Postgres are two systems with no free atomic transaction across
+both. The rule has to be **git write first, index update second** — if
+the index update fails, git is still correct and a background
+reconciliation job (walk each repo's refs, diff against `branches`) can
+self-heal the gap. Never the reverse order, or the index could claim a
+branch exists that git never actually got.
+
+### Confirmed: today's single repo is already git-object-only, no working-tree clone
+
+Directly relevant groundwork already in place for this RFC, verified by
+reading `GitRepositoryService.java` and inspecting the running container:
+`persistence-service` opens the repo via
+`Git.init().setDirectory(repoRoot.toFile())` (non-bare on disk, matching
+today's single-repo setup) but never calls `checkout()` or touches a
+working tree anywhere in the current code — confirmed no `git` binary
+even exists in the container, so there's no way it could be shelling out
+to one either. Every read/write goes through JGit's object-database API
+directly (`ObjectInserter`/`DirCache`/`RefUpdate`), the same pattern this
+RFC's multi-repo design assumes. `collab-server` never touches git or a
+filesystem clone at all; it only talks to `persistence-service` over
+HTTP — there is exactly one copy of the repository, not a clone plus a
+working copy some other service reads from.
+
 ## Verified and working
 
 - Realtime collaboration: TipTap + Yjs + Hocuspocus, multiple browser tabs,
