@@ -14,7 +14,7 @@
       button { font: inherit; margin-top: 1rem; padding: 0.45rem 1rem; border: 1px solid #444; border-radius: 4px; background: #222; color: #fff; cursor: pointer; }
       button:hover { background: #444; }
       ul#branch-list { padding-left: 1.2rem; }
-      #create-result, #merge-result { margin-top: 0.8rem; font-size: 0.9rem; white-space: pre-wrap; }
+      #create-result, #merge-result, #delete-result { margin-top: 0.8rem; font-size: 0.9rem; white-space: pre-wrap; }
       .ok { color: #1a7a1a; }
       .err { color: #b00020; }
       table.conflicts { border-collapse: collapse; width: 100%; margin-top: 0.5rem; font-size: 0.85rem; }
@@ -25,6 +25,9 @@
   <body>
     <a class="back" href="/">&larr; Back to editor</a>
     <h1>Branch admin</h1>
+    <p class="hint" style="font-size:0.85rem;color:#777;">See also the
+      <a href="/admin-mt.html">multi-tenant admin prototype</a> (customer
+      / document / version -- git-only, no Postgres yet).</p>
 
     <section>
       <h2>Branches</h2>
@@ -51,6 +54,14 @@
       <input type="text" id="merge-author" placeholder="e.g. Jens" />
       <button id="merge-btn" type="button">Merge</button>
       <div id="merge-result"></div>
+    </section>
+
+    <section>
+      <h2>Delete branch</h2>
+      <label for="delete-branch-select">Branch to delete</label>
+      <select id="delete-branch-select"></select>
+      <button id="delete-branch-btn" type="button">Delete branch</button>
+      <div id="delete-result"></div>
     </section>
 
     <script src="/admin.js"></script>

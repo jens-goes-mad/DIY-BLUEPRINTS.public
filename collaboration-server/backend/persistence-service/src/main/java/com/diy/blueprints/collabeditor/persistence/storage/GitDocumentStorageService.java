@@ -16,9 +16,12 @@ import org.springframework.stereotype.Service;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -325,6 +328,12 @@ public class GitDocumentStorageService implements DocumentStorageService {
   @Override
   public synchronized void deleteVersion(DocumentRef doc, String versionName) {
     unchecked("failed to delete branch " + versionName + " for " + doc.docId() + "/" + doc.language(), () -> {
+      // "master" holds a document's primary content and every other
+      // version's history traces back to it -- same protection as
+      // GitRepositoryService.deleteBranch on the single-repo model.
+      if ("master".equals(versionName)) {
+        throw new IllegalArgumentException("cannot delete the default version: " + versionName);
+      }
       try (Repository repo = openRepo(doc.customerId())) {
         String ref = refName(doc, versionName);
         RefUpdate refUpdate = repo.updateRef(ref);
@@ -378,6 +387,34 @@ public class GitDocumentStorageService implements DocumentStorageService {
           return new MergeOutcome(true, "MERGED", newCommitId.getName(), parsed.getParentCount());
         }
       }
+    });
+  }
+
+  /**
+   * NOT part of the DocumentStorageService interface -- same category as
+   * listAllRefs/findMergeBase. Scans the sharded repos.root directory tree
+   * directly for every customer's .git directory -- there's no Postgres
+   * customer registry yet (see STATE.md's RFC section), so this is the
+   * only way to enumerate customers right now. Fine at admin-tool scale
+   * (a directory scan, not a query against thousands of rows); not meant
+   * to be the long-term answer once the index actually exists.
+   */
+  public List<String> listCustomerIds() {
+    return unchecked("failed to list customers", () -> {
+      List<String> ids = new ArrayList<>();
+      if (!Files.isDirectory(reposRoot)) return ids;
+      try (DirectoryStream<Path> shards = Files.newDirectoryStream(reposRoot)) {
+        for (Path shard : shards) {
+          if (!Files.isDirectory(shard)) continue;
+          try (DirectoryStream<Path> repos = Files.newDirectoryStream(shard, "*.git")) {
+            for (Path repo : repos) {
+              String name = repo.getFileName().toString();
+              ids.add(name.substring(0, name.length() - ".git".length()));
+            }
+          }
+        }
+      }
+      return ids;
     });
   }
 

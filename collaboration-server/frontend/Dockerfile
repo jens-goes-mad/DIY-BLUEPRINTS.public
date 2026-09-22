@@ -13,6 +13,6 @@ RUN npm run build
 FROM nginx:alpine
 
 COPY --from=build /app/dist /usr/share/nginx/html
-COPY admin.html admin.js /usr/share/nginx/html/
+COPY admin.html admin.js admin-mt.html admin-mt.js /usr/share/nginx/html/
 
 EXPOSE 80

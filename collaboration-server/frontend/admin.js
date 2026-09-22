@@ -34,6 +34,10 @@ async function refresh() {
   fillSelect(document.getElementById('from-branch'), branches, 'master')
   fillSelect(document.getElementById('source-branch'), branches)
   fillSelect(document.getElementById('target-branch'), branches, 'master')
+  // master is never deletable (see GitRepositoryService.deleteBranch) -- left
+  // out of this select entirely rather than letting the user pick it and
+  // then bounce off a server-side error.
+  fillSelect(document.getElementById('delete-branch-select'), branches.filter((b) => b !== 'master'))
 }
 
 function renderConflicts(conflicts) {
@@ -118,6 +122,35 @@ document.getElementById('merge-btn').addEventListener('click', async () => {
       resultEl.innerHTML =
         `<span class="err">Not merged -- ${body.conflicts.length} conflict(s) found:</span>` + renderConflicts(body.conflicts)
     }
+  } catch (err) {
+    resultEl.textContent = 'Failed: ' + err.message
+    resultEl.className = 'err'
+  }
+})
+
+document.getElementById('delete-branch-btn').addEventListener('click', async () => {
+  const branch = document.getElementById('delete-branch-select').value
+  const resultEl = document.getElementById('delete-result')
+
+  if (!branch) {
+    resultEl.textContent = 'Pick a branch to delete.'
+    resultEl.className = 'err'
+    return
+  }
+  if (!confirm(`Delete branch "${branch}"? This cannot be undone from this page.`)) {
+    return
+  }
+
+  resultEl.textContent = 'Deleting...'
+  resultEl.className = ''
+  try {
+    const res = await fetch(`${PERSISTENCE_URL}/api/branches/${encodeURIComponent(branch)}`, {
+      method: 'DELETE',
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`)
+    resultEl.textContent = `Deleted "${branch}".`
+    resultEl.className = 'ok'
+    await refresh()
   } catch (err) {
     resultEl.textContent = 'Failed: ' + err.message
     resultEl.className = 'err'

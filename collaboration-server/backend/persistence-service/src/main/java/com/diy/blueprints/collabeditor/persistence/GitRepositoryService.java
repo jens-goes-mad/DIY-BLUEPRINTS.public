@@ -198,6 +198,26 @@ public class GitRepositoryService {
   }
 
   /**
+   * The default branch is never deletable -- every docId's content lives
+   * there, and every other branch's history traces back to it, so
+   * deleting it would orphan the whole repo, not just remove one line of
+   * history.
+   */
+  public synchronized void deleteBranch(String branch) throws IOException {
+    if (DEFAULT_BRANCH.equals(branch)) {
+      throw new IllegalArgumentException("cannot delete the default branch: " + branch);
+    }
+    try (Repository repo = openRepo()) {
+      RefUpdate refUpdate = repo.updateRef("refs/heads/" + branch);
+      refUpdate.setForceUpdate(true);
+      RefUpdate.Result result = refUpdate.delete();
+      if (result != RefUpdate.Result.FORCED && result != RefUpdate.Result.NO_CHANGE) {
+        throw new IOException("failed to delete branch " + branch + ": " + result);
+      }
+    }
+  }
+
+  /**
    * The commit both branches diverged from -- needed by collab-server to
    * detect conflicts before merging (it decodes what each branch actually
    * changed relative to this shared ancestor). Returns null if the

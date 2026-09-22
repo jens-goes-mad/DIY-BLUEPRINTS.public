@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Multi-Tenant Admin</title>
+    <style>
+      body { font-family: sans-serif; max-width: 700px; margin: 2rem auto; color: #222; }
+      h1 { font-size: 1.3rem; }
+      a.back { font-size: 0.9rem; color: #555; }
+      p.hint { font-size: 0.85rem; color: #777; }
+      section { border: 1px solid #ccc; border-radius: 6px; padding: 1rem 1.2rem; margin: 1.5rem 0; }
+      section h2 { margin-top: 0; font-size: 1.05rem; }
+      label { display: block; font-size: 0.85rem; color: #444; margin: 0.6rem 0 0.2rem; }
+      select, input[type="text"] { font: inherit; padding: 0.35rem 0.5rem; border: 1px solid #ccc; border-radius: 4px; width: 100%; box-sizing: border-box; }
+      button { font: inherit; margin-top: 1rem; padding: 0.45rem 1rem; border: 1px solid #444; border-radius: 4px; background: #222; color: #fff; cursor: pointer; }
+      button:hover { background: #444; }
+      ul#version-list { padding-left: 1.2rem; }
+      [id$="-result"] { margin-top: 0.8rem; font-size: 0.9rem; white-space: pre-wrap; }
+      .ok { color: #1a7a1a; }
+      .err { color: #b00020; }
+    </style>
+  </head>
+  <body>
+    <a class="back" href="/admin.html">&larr; Back to branch admin</a>
+    <h1>Multi-tenant admin (prototype)</h1>
+    <p class="hint">No Postgres index yet -- customers/documents/versions
+      below are all derived live from git on every request (see
+      STATE.md's RFC section). Fine at this scale, not the long-term
+      query path.</p>
+
+    <section>
+      <h2>Customer</h2>
+      <label for="customer-select">Existing customers</label>
+      <select id="customer-select"></select>
+      <label for="new-customer-slug">New customer slug</label>
+      <input type="text" id="new-customer-slug" placeholder="e.g. acme-corp" />
+      <label for="new-customer-name">Display name</label>
+      <input type="text" id="new-customer-name" placeholder="e.g. Acme Corp" />
+      <button id="create-customer-btn" type="button">Create customer</button>
+      <div id="customer-result"></div>
+    </section>
+
+    <section>
+      <h2>Document</h2>
+      <label for="document-select">Existing documents (for selected customer)</label>
+      <select id="document-select"></select>
+      <label for="new-doc-id">New document docId</label>
+      <input type="text" id="new-doc-id" placeholder="e.g. onboarding-guide" />
+      <label for="new-doc-language">Language</label>
+      <input type="text" id="new-doc-language" placeholder="e.g. en" />
+      <label for="new-doc-title">Title</label>
+      <input type="text" id="new-doc-title" placeholder="e.g. Onboarding Guide" />
+      <button id="create-document-btn" type="button">Create document</button>
+      <div id="document-result"></div>
+    </section>
+
+    <section>
+      <h2>Versions (for selected document)</h2>
+      <ul id="version-list"><li>pick a customer and document</li></ul>
+
+      <label for="new-version-name">New version name</label>
+      <input type="text" id="new-version-name" placeholder="e.g. review-q3" />
+      <label for="from-version-select">From version</label>
+      <select id="from-version-select"></select>
+      <button id="create-version-btn" type="button">Create version</button>
+      <div id="create-version-result"></div>
+
+      <label for="delete-version-select">Delete version</label>
+      <select id="delete-version-select"></select>
+      <button id="delete-version-btn" type="button">Delete version</button>
+      <div id="delete-version-result"></div>
+    </section>
+
+    <script src="/admin-mt.js"></script>
+  </body>
+</html>

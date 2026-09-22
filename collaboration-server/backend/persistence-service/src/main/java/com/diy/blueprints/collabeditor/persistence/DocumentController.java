@@ -71,6 +71,11 @@ public class DocumentController {
     gitRepositoryService.createBranch(request.newBranch(), request.fromBranch());
   }
 
+  @DeleteMapping("/api/branches/{branch}")
+  public void deleteBranch(@PathVariable String branch) throws Exception {
+    gitRepositoryService.deleteBranch(branch);
+  }
+
   @PostMapping("/api/documents/{docId}/merge")
   public MergeOutcome merge(@PathVariable String docId, @RequestBody MergeRequest request) throws Exception {
     byte[] ydocBytes = Base64.getDecoder().decode(request.ydoc());
