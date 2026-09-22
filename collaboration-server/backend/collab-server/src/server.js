@@ -6,7 +6,7 @@ import cors from 'cors'
 import { schema } from './schema.js'
 import { createMarkdownSerializer } from './markdown.js'
 import { loadSnapshot, saveSnapshot } from './persistenceClient.js'
-import { loadLocal, appendDelta, compact, COMPACT_LOG_BYTES } from './localStore.js'
+import { loadLocal, appendDelta, compact, COMPACT_LOG_BYTES, listLocalDocuments } from './localStore.js'
 import { mergeBranches } from './mergeBranches.js'
 import { uploadAsset } from './artifactKeeperClient.js'
 
@@ -247,11 +247,74 @@ const hocuspocus = Server.configure({
         })
       }
     }
-    liveDocuments.delete(documentName)
+    // Only drop the entry once git has actually caught up (checkpointToGit
+    // clears entry.dirty itself, only on success). A still-dirty entry
+    // here means the final checkpoint attempt above just failed (or
+    // persistence-service was already down) -- the unsynced edits are
+    // safe in the fast tier's disk log, but git is behind, and previously
+    // nothing would ever retry once the last viewer left: the entry got
+    // deleted unconditionally, so the periodic sweep (which only walks
+    // liveDocuments) had nothing left to find. Keeping the entry alive
+    // means that same 60s sweep keeps retrying it with zero viewers
+    // connected -- logged every attempt -- until it lands or a reconnect
+    // replaces this entry via a fresh onLoadDocument. Documents that
+    // never catch up (a sustained persistence-service outage) do stay
+    // resident in memory holding their Y.Doc until they do; an acceptable
+    // trade for not silently abandoning a pending git write.
+    if (!entry || !entry.dirty) {
+      liveDocuments.delete(documentName)
+    }
   },
 })
 
 hocuspocus.listen()
+
+// The periodic checkpoint sweep only ever looks at liveDocuments, and that
+// map is entirely in-memory -- a collab-server restart loses it completely,
+// dirty-tracking included, even though the fast tier's files on disk are
+// untouched. Without this, a document that was mid-retry (persistence-service
+// down, say) when the process stopped would just sit there un-checkpointed
+// indefinitely: nothing resumes retrying it until someone happens to
+// reconnect to that exact document again. Scanning the fast tier at startup
+// and seeding liveDocuments from whatever's already on disk closes that gap
+// -- the very next periodic tick picks these up exactly like any other
+// dirty document, no reconnect required. Mirrors onLoadDocument's own
+// fast-tier-recovery path (same dirty=true, contributors=['restored']
+// convention used for crash recovery there).
+async function reconcileFastTierOnStartup() {
+  let documentNames
+  try {
+    documentNames = await listLocalDocuments()
+  } catch (err) {
+    console.error('[startup-reconcile] failed to list fast-tier documents:', err.message)
+    return
+  }
+
+  for (const documentName of documentNames) {
+    if (liveDocuments.has(documentName)) continue // a connection already beat this scan to it
+    try {
+      const chunks = await loadLocal(documentName)
+      if (!chunks || chunks.length === 0) continue
+      const { docId, branch } = parseDocumentName(documentName)
+      const doc = new Y.Doc()
+      for (const chunk of chunks) Y.applyUpdate(doc, chunk)
+      liveDocuments.set(documentName, {
+        document: doc,
+        docId,
+        branch,
+        dirty: true,
+        contributors: new Set(['restored']),
+        lastSavedStateVector: Y.encodeStateVector(doc),
+        changelog: [],
+      })
+      console.log(`[startup-reconcile] found pending fast-tier data for "${documentName}", queued for checkpoint`)
+    } catch (err) {
+      console.error(`[startup-reconcile] failed to load "${documentName}":`, err.message)
+    }
+  }
+}
+
+reconcileFastTierOnStartup()
 
 process.on('unhandledRejection', (err) => {
   console.error('[unhandledRejection] swallowed to keep collab-server alive:', err)

@@ -3,3 +3,24 @@ server:
 
 repo:
   path: /data/repo
+
+# Multi-tenant repo root for the new DocumentStorageService/
+# GitDocumentStorageService (RFC: multi-tenant scale, STATE.md) -- separate
+# from the single-repo "repo.path" above, which still backs the live
+# GitRepositoryService/DocumentController untouched.
+repos:
+  root: /data/repos
+
+spring:
+  autoconfigure:
+    exclude:
+      # spring-boot-starter-data-jpa is on the classpath so the new index/
+      # orchestration/reconciliation layer compiles as real JPA code, but
+      # there's no Postgres container for it yet -- without this exclusion
+      # Spring Boot would try to auto-create a DataSource at startup and
+      # fail, breaking the currently-running app. Remove once a real
+      # datasource is configured (the actual "wire it into the live stack"
+      # step, deliberately deferred -- see STATE.md).
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration
+      - org.springframework.boot.autoconfigure.orm.jpa.JpaRepositoriesAutoConfiguration

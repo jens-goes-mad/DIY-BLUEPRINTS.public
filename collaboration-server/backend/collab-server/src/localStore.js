@@ -84,3 +84,23 @@ export async function compact(docId, fullStateBytes) {
   await fs.writeFile(basePath(docId), fullStateBytes)
   await fs.writeFile(logPath(docId), Buffer.alloc(0))
 }
+
+/**
+ * Every documentName that has anything on disk in the fast tier, regardless
+ * of whether collab-server currently has it loaded in memory. Used at
+ * startup to find documents that were mid-checkpoint-retry (or simply
+ * edited) when the process was last stopped -- their in-memory dirty
+ * tracking doesn't survive a restart, but their bytes on disk do, and
+ * without this scan nothing would resume retrying them until someone
+ * happens to reconnect to that exact document again.
+ */
+export async function listLocalDocuments() {
+  await fs.mkdir(LIVE_STORE_PATH, { recursive: true })
+  const files = await fs.readdir(LIVE_STORE_PATH)
+  const names = new Set()
+  for (const file of files) {
+    if (file.endsWith('.base.ydoc')) names.add(file.slice(0, -'.base.ydoc'.length))
+    else if (file.endsWith('.updates.log')) names.add(file.slice(0, -'.updates.log'.length))
+  }
+  return [...names]
+}

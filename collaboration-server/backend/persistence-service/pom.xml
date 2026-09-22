@@ -33,6 +33,23 @@
       <version>${jgit.version}</version>
     </dependency>
 
+    <!-- Postgres query index (RFC: multi-tenant scale, see STATE.md). Added
+         so the index/orchestration/reconciliation layer compiles as real
+         Spring Data JPA code; NOT yet wired to a live datasource or a
+         running Postgres container. See the autoconfigure.exclude in
+         application.yml: without it, merely having this on the classpath
+         would make Spring Boot try to create a DataSource at startup and
+         fail, breaking the currently-running single-tenant git-only app. -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-test</artifactId>

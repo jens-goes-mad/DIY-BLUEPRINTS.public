@@ -391,6 +391,53 @@ need shared history between language variants.)
 doc" is still answerable directly from git as a defense-in-depth check
 against the index (see consistency note below), not solely from Postgres.
 
+**Descriptive metadata (doc title, etc.) lives in git too, written once,
+not only in Postgres**: a `<docId>.meta.json` committed at
+`createDocument` time, alongside `<docId>.ydoc`/`.md`. This metadata is
+effectively read-only in practice (a title rename is a hypothetical future
+feature, not a current need — build that encoder only if it's ever actually
+needed, same reasoning as everywhere else in this codebase), so writing it
+once and treating it as immutable is a deliberate, low-cost decision, not
+a limitation. Every branch forked afterward inherits the file automatically
+via ordinary git ancestry — no per-branch rewrite needed — so the
+reconciliation sweep (see the RFC addendum below) can recover full document
+identity, including title, from *any* branch's tip tree alone, closing what
+was otherwise a real gap: without this, a lost `document_created` event
+with no surviving outbox row would reconcile structure correctly but lose
+the title permanently, since nothing in the git ref/branch naming scheme
+itself carries it. The same idea extends to the customer level — a
+`_customer.meta.json` at repo root, written once at `createCustomer` — with
+a nice side effect: even a fully-lost `customers` table becomes
+reconstructable by scanning `/data/repos/**/*.git` and reading each repo's
+own metadata file, not just its documents/branches.
+
+### Reconciliation sweep (addendum, agreed but not yet built)
+
+Beyond the outbox's fast path (write to Postgres immediately after the git
+write succeeds), a periodic sweep is the actual durability guarantee —
+the outbox row itself isn't atomic with the git write (they're two
+different systems), so if Postgres is unreachable at that exact instant,
+neither the direct index update nor the outbox insert happens, and
+nothing is left to retry from except git itself. Two cadences, mirroring
+the pattern already built and verified for `collab-server`'s own
+git-checkpoint retry (see "Verified and working" above): a startup sweep
+(catches drift from whenever `persistence-service` was last down) and a
+coarser periodic full sweep (every 10–15 min, not seconds — ref reads are
+cheap individually but adds up across hundreds of repos on a tight
+interval, and the outbox already covers the common case).
+
+For each `ready` customer, list every ref under `refs/heads/` and its tip
+SHA, then diff against `branches`: a ref with no matching row is an
+INSERT (recovering `docId`/`language`/`branchName` from the ref path, and
+now the title too, from that branch's `<docId>.meta.json`); a row whose
+`head_commit_sha` doesn't match the ref's actual tip is an UPDATE; a row
+whose ref no longer exists is a DELETE. No locking needed — a ref that's
+mid-update during a sweep just means that row is briefly one commit
+behind, caught on the next pass or the normal write path either way. Log
+every actual correction, stay silent on no-ops — an unusually high
+correction rate is itself the signal that the outbox/direct-write path
+needs attention.
+
 ### Postgres schema
 
 ```sql
@@ -450,23 +497,30 @@ ref-name parsing at query time: branches for a customer is
   `archiveCustomer` (soft-delete only — hard repo deletion stays a
   separate, explicitly-confirmed operation, same caution as the 2026-09-22
   volume wipe below).
-- **Document lifecycle**: `createDocument(customerId, docId, language,
-  title)` — index row plus seeds the `master` branch (ref + empty
-  snapshot + `is_default=true` row). Plus `listDocuments(customerId,
-  {language?})`, `getDocument(customerId, docId, language)`.
-- **Branch lifecycle**: `createBranch(customerId, docId, language,
-  branchName, fromBranch = 'master')`, `listBranches(customerId, {docId?,
+- **Document lifecycle**: `createDocument(DocumentRef, meta)` — one git
+  commit seeding an empty initial "master" version and recording identity
+  together (see "Java scaffolding" below for why these aren't two
+  separate calls), plus the matching Postgres rows. Plus
+  `listDocuments(customerId, {language?})`, `getDocument(customerId,
+  docId, language)`.
+- **Branch lifecycle**: `createVersion(DocumentRef, versionName,
+  fromVersionName)`, `deleteVersion(DocumentRef, versionName)` (renamed
+  from createBranch/deleteBranch during implementation — "branch" only
+  survives where it's genuinely git-specific now; we had no equivalent of
+  delete at all before this RFC — the 2026-09-22 "reset everything"
+  request had to fall back to a full Docker volume wipe because no
+  branch-delete API existed), `listBranches(customerId, {docId?,
   language?})` (the general-purpose query behind all three motivating
-  lookups), `deleteBranch(...)` (we have no equivalent of this today at
-  all — the 2026-09-22 "reset everything" request had to fall back to a
-  full Docker volume wipe because no branch-delete API existed), and
-  `mergeBranch(customerId, docId, language, source, target, author)` —
-  same conflict logic `conflicts.js` already has, scoped to the customer's
-  repo.
-- **Content**: `loadSnapshot`/`saveSnapshot` adapt today's versions by
-  resolving `customers.repo_path` first; `saveSnapshot` additionally
-  updates `branches.head_commit_sha` and `documents.updated_at` after the
-  git write succeeds.
+  lookups), and `mergeBranch(DocumentRef, source, target, author)` — same
+  conflict logic `conflicts.js` already has, scoped to the customer's repo.
+- **Content**: `load(DocumentRef, versionName)`/`save(DocumentRef,
+  versionName, ...)` — `save` additionally updates
+  `branches.head_commit_sha` and `documents.updated_at` after the git
+  write succeeds.
+
+`DocumentRef(customerId, docId, language)` bundles what used to be three
+repeated string parameters on nearly every method above — see "Java
+scaffolding" below.
 
 ### Consistency caveat
 
@@ -492,6 +546,163 @@ RFC's multi-repo design assumes. `collab-server` never touches git or a
 filesystem clone at all; it only talks to `persistence-service` over
 HTTP — there is exactly one copy of the repository, not a clone plus a
 working copy some other service reads from.
+
+### Java scaffolding exists and compiles — deliberately dormant, not wired in
+
+The layered design above (`DocumentStorageService` interface hiding git
+internals behind private methods, `DocumentIndexService` shielding the
+Postgres repositories, `DocumentPersistenceCoordinator` as the one place
+that sequences a git write then an index update, `OutboxWorker` and
+`GitReconciliationService` for the two failure-recovery tiers) is written
+as real, final-shape Java under `backend/persistence-service/src/main/
+java/.../persistence/{storage,index,orchestration,reconcile}/` — not
+pseudocode. Verified by actually compiling it (`docker build --target
+build`, a separate tag from the live image, never touching the running
+container) after every change below, not just the first pass: all 25
+source files build clean, jar packages, Spring Boot repackages.
+
+**Refined through several rounds of real feedback after the first pass**,
+each verified by recompiling, not just eyeballed:
+- `DocumentRef(customerId, docId, language)` replaces the repeated
+  three-string parameter group that used to appear on nearly every
+  `DocumentStorageService`/`DocumentPersistenceCoordinator` method.
+- `initCustomer(customerId, meta)` and `createDocument(doc, meta)` fold
+  what were originally two separately-callable primitives each
+  (`initRepo` + a standalone `writeCustomerMeta`; a standalone
+  `writeDocumentMeta` + an empty `save()`) into one atomic git commit
+  apiece. They were never legitimately called independently of one
+  another, and exposing them separately invited a caller to leak *how*
+  git durably records identity (a file every branch inherits via
+  ordinary ancestry) as if that were itself a generic storage primitive.
+  `readDocumentMeta` was demoted off the interface entirely for the same
+  reason — its only caller, `GitReconciliationService`, is already
+  explicitly typed to the concrete git class, not the interface, so
+  keeping it on the interface never bought anything.
+- `createBranch`/`deleteBranch` renamed to `createVersion`/
+  `deleteVersion` everywhere they meant "a named line of history you can
+  save to," across `DocumentStorageService`, `GitDocumentStorageService`,
+  `DocumentPersistenceCoordinator`, and `DocumentIndexService` — "branch"
+  now survives only where it's genuinely git-specific (ref paths, the
+  git-only `GitDocumentStorageService.listAllRefs`/`findMergeBase` extras,
+  `GitReconciliationService`'s own ref-parsing).
+- No method on `DocumentStorageService` declares a checked exception —
+  forcing every implementation (including a fake test one with no real
+  I/O to fail) and every caller (most of whom can't meaningfully recover
+  from a storage failure) to handle a failure mode that's really an
+  implementation detail was never the interface's job. `GitDocumentStorageService`
+  funnels every method body through a small `unchecked(message, lambda)`
+  helper that catches whatever JGit/Jackson/java.io actually throws and
+  rewraps it as the new unchecked `StorageException`; a `RuntimeException`
+  already thrown deliberately inside a method body (e.g. "branch already
+  exists") passes through unwrapped, not double-wrapped.
+- `ReconciliationService` renamed to `GitReconciliationService`, and its
+  constructor now takes the concrete `GitDocumentStorageService` instead
+  of the generic `DocumentStorageService` interface — reconciliation is
+  inherently about diffing an actual git repo's ref state, not a generic
+  storage concern, so pretending otherwise was the wrong shape.
+  `listAllRefs` moved off the interface to match, same category as
+  `readDocumentMeta`/`findMergeBase`.
+- Git-specific vocabulary was audited out of every generic layer's
+  *public* surface (interface method/parameter names, the `Branch`
+  entity's `versionName` field, its `BranchRepository` query method) —
+  see "Open topics" below for the two spots (`Branch.headCommitSha`,
+  `MergeOutcome.commitId`) explicitly left as-is or still undecided.
+
+**Deliberately not wired into the live request path yet**, per this
+project's own small-iterations rule — this is new architecture, and the
+currently-running single-tenant git-only app (`GitRepositoryService`,
+`DocumentController`) is completely untouched, not modified or replaced.
+Concretely:
+- `spring-boot-starter-data-jpa` + the Postgres driver were added to
+  `pom.xml` so the index/orchestration/reconciliation layer compiles as
+  real JPA code, but `application.yml` explicitly excludes
+  `DataSourceAutoConfiguration`/`HibernateJpaAutoConfiguration`/
+  `JpaRepositoriesAutoConfiguration` — without that, merely having the
+  starter on the classpath makes Spring Boot try to auto-create a
+  `DataSource` at startup with no Postgres container to point at, which
+  would have broken the currently-running app the next time it restarts.
+- `GitDocumentStorageService` is `@Service`-annotated (safe — its only
+  dependency is a config path, nothing missing), coexisting as a second,
+  independent bean alongside the existing untouched `GitRepositoryService`.
+  `DocumentIndexServiceImpl`, `DocumentPersistenceCoordinator`,
+  `OutboxWorker`, and `GitReconciliationService` are deliberately **not**
+  Spring-annotated yet — they depend on the Spring Data repository beans
+  that don't exist while JPA autoconfiguration stays excluded, and
+  `@SpringBootApplication`'s default component scan would otherwise try to
+  instantiate them at boot regardless of whether any controller calls
+  them, failing startup. The remaining wiring step, once a real Postgres
+  container exists and the exclusion is lifted, is exactly two things:
+  add `@Service`/`@Component` to those four classes, and point
+  `DocumentController` (or a new controller) at
+  `DocumentPersistenceCoordinator`/`DocumentIndexService` instead of
+  `GitRepositoryService` directly. Nothing about the classes' internal
+  logic needs to change for that step.
+- Two real bugs were caught and fixed during the first pass by actually
+  compiling and reasoning through the write paths, not just writing code
+  and reading it back: `Customer`'s client-assigned UUID id (needed before
+  the first save, to derive the sharded repo path) made Spring Data JPA's
+  default insert-vs-update detection wrong until it was made to implement
+  `Persistable<UUID>` explicitly; and `upsertBranch`/`upsertDocument`
+  originally saved the caller's fresh transient instance directly, which
+  would have collided with the unique constraint on every call after the
+  first for the same branch/document — fixed to look up the existing row
+  by natural key and update it in place.
+
+### Open topics on the RFC scaffolding (deliberately unresolved — read before touching this code)
+
+**Why any of this exists at all:** the motivating problem (see "RFC: multi-tenant
+scale" above) is that "hundreds of customers × hundreds of documents ×
+languages × branches" makes git alone unusable for *querying* — "show me
+all branches for customer X," "docs for a customer," "branches of a doc"
+have no git-native answer beyond a linear ref scan by naming convention.
+The scaffolding below exists to answer those queries from Postgres while
+keeping git as the sole source of truth for content and history — nothing
+here is scope creep, all of it traces back to that one query problem.
+
+Several follow-ups were raised and explicitly **not** decided yet, on
+purpose — noted here so the reasoning (and the fact that a decision is
+still pending, not forgotten or silently abandoned) survives even if this
+thread isn't picked back up for a while:
+
+- **`Branch.headCommitSha`** (the JPA entity field, `index/entity/Branch.java`)
+  still names a git-specific concept (a commit SHA) on what's meant to be
+  a storage-agnostic Postgres index row. Flagged, genuinely left
+  undecided — the last round of instructions covered items 2–11 of a
+  numbered list but skipped item 1 (this one) without saying so
+  explicitly, so it's being carried forward as open rather than assumed
+  either way.
+- **`MergeOutcome.commitId`** — same git-specific naming issue, but
+  **deliberately kept as-is for now**, a real decision (not an oversight):
+  unlike everything else in this RFC pass, `MergeOutcome` isn't new/dormant
+  code — it's already live, consumed today by `GitRepositoryService.merge()`,
+  `collab-server`'s `mergeBranches.js`, and the branch-admin UI's conflict
+  display. Renaming it means touching shipped, working code across two
+  languages, not just inert scaffolding — a higher-risk change than
+  anything else in this pass, explicitly deferred to a separate, more
+  careful pass rather than bundled in here.
+- **Wiring the scaffolding into the live app is explicitly not being
+  pursued right now** (a real "ignored for now," not an oversight): no
+  Postgres container in `docker-compose.yml` for the index yet;
+  `DocumentIndexServiceImpl`/`DocumentPersistenceCoordinator`/
+  `OutboxWorker`/`GitReconciliationService` still lack `@Service`/
+  `@Component`; `DocumentController` still talks only to the old
+  single-repo `GitRepositoryService`; the JPA autoconfiguration exclusion
+  in `application.yml` hasn't been lifted; `OutboxWorker`/
+  `GitReconciliationService` have no `@Scheduled` cadence. All of this is
+  one coherent next step (see "Java scaffolding exists and compiles"
+  above for exactly what that step is), deliberately not started until
+  it's actually prioritized — this project's small-iterations rule means
+  proving the scaffolding compiles and reasons correctly first, wiring it
+  live second, not both in the same pass.
+- **`OutboxWorker.applyCustomer`** doesn't reconstruct `status` on retry
+  (a retried customer always lands as `PROVISIONING`) — accepted as a
+  known simplification, revisit only if a real scenario needs status to
+  survive a retry.
+- **The fake in-memory `DocumentStorageService` implementation** that the
+  interface's own javadoc justifies its existence by (unit-testing
+  merge/conflict logic without a real git repo) doesn't exist yet either
+  — nothing has actually exercised that promised testability benefit so
+  far.
 
 ## Verified and working
 
@@ -536,6 +747,55 @@ working copy some other service reads from.
   `collab-server` (this happened for real once — see "Incidents" below —
   and is now fixed and covered by a process-level `unhandledRejection`
   handler as a last resort). Every service has `restart: unless-stopped`.
+- Git-checkpoint retry survives the last viewer disconnecting: originally
+  `afterUnloadDocument` deleted a document's in-memory tracking entry
+  unconditionally once all viewers left, even if its one last checkpoint
+  attempt had just failed — meaning a persistence-service outage that
+  happened to align with everyone disconnecting left that document's git
+  commit permanently un-retried, with nothing watching to pick it back up
+  until someone happened to reconnect to that *exact* document again. Fixed
+  by only deleting the entry once it's actually clean (`checkpointToGit`
+  clears `dirty` solely on success); a still-dirty entry now stays in
+  `liveDocuments` with zero viewers attached, so the same 60s periodic
+  sweep keeps retrying it in the background, logged every attempt, same as
+  if someone were still connected. No data is ever at risk either way — the
+  fast tier already has every edit durably on local disk within ~8s
+  regardless of git's state — this is purely about *how long git can stay
+  behind unnoticed* and closing the gap that mattered for the "container/
+  pod gets destroyed before git catches up" scenario. Verified directly
+  against the live stack: stopped `persistence-service`, connected, edited,
+  and disconnected (triggering the expected first failure), then watched
+  the periodic sweep keep retrying with zero active connections across
+  multiple 60s ticks, then restarted `persistence-service` and confirmed
+  the very next tick committed the edit successfully with no reconnect
+  needed at any point.
+- Git-checkpoint retry survives `collab-server` itself restarting, not just
+  the last viewer disconnecting: the above fix only helps as long as
+  `liveDocuments` (purely in-memory) still has the entry — a `collab-server`
+  restart wipes it entirely, even though the fast tier's files on disk are
+  untouched, so a document that was mid-retry when the process stopped
+  previously had nothing resuming it until someone happened to reconnect to
+  that *exact* document again. Fixed with a startup scan
+  (`listLocalDocuments()` in `localStore.js`, `reconcileFastTierOnStartup()`
+  in `server.js`) that lists everything present in the fast tier, loads
+  each into a fresh `Y.Doc`, and seeds `liveDocuments` with `dirty: true` —
+  mirroring `onLoadDocument`'s own fast-tier-recovery convention
+  (`contributors: ['restored']`) — so the very next periodic sweep picks
+  them up exactly like any other dirty document, no reconnect required.
+  Verified against the live stack end-to-end: edited a fresh branch while
+  `persistence-service` was down, disconnected, confirmed the fast-tier
+  files existed on disk, then restarted `collab-server` itself (wiping its
+  memory) while `persistence-service` was *still* down, confirmed the
+  startup scan found and queued the doc from disk alone, then brought
+  `persistence-service` back up and confirmed the next periodic tick
+  committed it successfully — zero reconnects at any point in the whole
+  chain. One transient, non-fatal side effect observed during testing: a
+  `local store read failed: Unexpected end of array` on one document,
+  caused by the new startup scan's read racing a lingering live
+  reconnect's own read/write of the same fast-tier files at boot; already
+  caught by existing error handling (falls through gracefully, no crash),
+  and that same document still checkpointed successfully on the very next
+  attempt.
 - Image upload (drag-and-drop → Artifact Keeper → read-only URL reference
   in the document): proven end-to-end with a real headless-browser
   simulated drop — see "Image upload" above.
