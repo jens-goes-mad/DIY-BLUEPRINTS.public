@@ -5,11 +5,11 @@
     <title>Collaborative Editor</title>
     <style>
       body { font-family: sans-serif; max-width: 800px; margin: 2rem auto; }
-      #top-bar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+      #top-bar { display: flex; flex-direction: column; gap: 0.4rem; margin-bottom: 1rem; }
       #user-badge { font-weight: bold; }
       #branch-picker { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; }
-      #branch-select { font: inherit; padding: 0.25rem 0.4rem; border-radius: 4px; border: 1px solid #ccc; }
-      #admin-link { font-size: 0.85rem; color: #555; }
+      #branch-select { font: inherit; padding: 0.25rem 0.4rem; border-radius: 4px; border: 1px solid #ccc; flex: 1; min-width: 0; }
+      #admin-link { font-size: 0.85rem; color: #555; white-space: nowrap; margin-left: auto; }
       #toolbar {
         display: flex;
         flex-wrap: wrap;

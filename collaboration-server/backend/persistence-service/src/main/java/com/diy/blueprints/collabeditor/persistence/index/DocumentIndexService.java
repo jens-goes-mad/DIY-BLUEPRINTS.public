@@ -28,9 +28,9 @@ public interface DocumentIndexService {
 
   // -- reads --
   List<Customer> listCustomers();
-  Optional<Customer> getCustomer(UUID customerId);
-  List<Document> listDocuments(UUID customerId, String languageOrNull);
-  Optional<Document> getDocument(UUID customerId, String docId, String language);
+  Optional<Customer> getCustomer(String customerId);
+  List<Document> listDocuments(String customerId);
+  Optional<Document> getDocument(String customerId, String docId);
   List<Branch> listBranches(UUID documentId);
 
   // -- writes: each also records an outbox_events row in the same

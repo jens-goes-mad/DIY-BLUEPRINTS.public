@@ -2,6 +2,7 @@ package com.diy.blueprints.collabeditor.persistence.storage;
 
 import com.diy.blueprints.collabeditor.persistence.MergeOutcome;
 
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -31,6 +32,15 @@ import java.util.Optional;
  * is recorded durably enough to survive losing the Postgres index and be
  * recovered from storage alone -- not how.
  *
+ * A version is a unit of change that may touch several languages over
+ * its lifetime, not a per-language branch namespace (revised design --
+ * see DocumentRef's javadoc and STATE.md's RFC section): it typically
+ * starts by changing one language (often the source/master language) and
+ * picks up translations incrementally, all within the same version,
+ * until merging to master represents "every language is ready to ship."
+ * That's why language is a parameter alongside versionName on the
+ * content methods below, not part of DocumentRef itself.
+ *
  * Distinct on purpose from DocumentIndexService (Postgres-backed queries)
  * -- this interface is about content and history, that one is about fast
  * lookups. Collapsing them into one interface would blur exactly the line
@@ -41,18 +51,23 @@ public interface DocumentStorageService {
   /** Provisions storage for a brand-new customer and durably records its identity. Idempotent: a no-op if already provisioned. */
   void initCustomer(String customerId, CustomerMeta meta);
 
-  /** Provisions a brand-new document (seeding its initial version) and durably records its identity. Returns the initial version's identifier. */
+  /** Provisions a brand-new document (seeding its master version, no language content yet) and durably records its identity. Returns the initial version's identifier. */
   String createDocument(DocumentRef doc, DocumentMeta meta);
 
-  Optional<byte[]> load(DocumentRef doc, String versionName);
+  /** Every language present in this version's tree. */
+  List<String> listLanguages(DocumentRef doc, String versionName);
+
+  Optional<byte[]> load(DocumentRef doc, String versionName, String language);
 
   /**
-   * Writes a new version carrying contentBytes/markdown/changelogJson for
-   * this document. Returns an opaque identifier for that new version so
-   * the caller (DocumentPersistenceCoordinator) can record it as
-   * branches.head_commit_sha.
+   * Writes contentBytes/markdown/changelogJson for one language within
+   * this version. Returns an opaque identifier for the resulting version
+   * state so the caller (DocumentPersistenceCoordinator) can record it as
+   * branches.head_commit_sha. Every other language already present in
+   * this version's tree, and the document's own meta.json, are carried
+   * forward untouched.
    */
-  String save(DocumentRef doc, String versionName,
+  String save(DocumentRef doc, String versionName, String language,
               byte[] contentBytes, String markdown, String changelogJson, String author);
 
   /** Returns the new version's current identifier (same as fromVersionName's). */
@@ -60,6 +75,6 @@ public interface DocumentStorageService {
 
   void deleteVersion(DocumentRef doc, String versionName);
 
-  MergeOutcome merge(DocumentRef doc, String sourceVersionName, String targetVersionName,
+  MergeOutcome merge(DocumentRef doc, String sourceVersionName, String targetVersionName, String language,
                       byte[] mergedContentBytes, String mergedMarkdown, String author);
 }

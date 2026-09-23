@@ -379,17 +379,22 @@ GitHub/GitLab already solve, and for the same reason: they don't query raw
 git refs for their own UI either, they maintain their own DB index over
 git and use git purely for object storage.
 
-**Document identity includes language**: `("onboarding-guide", "en")` and
-`("onboarding-guide", "de")` are two independent documents with
-independent branch histories, not two branches of one document — they're
-not realistic merge candidates of each other. (Flagged as the biggest
-assumption in this design; revisit if translation workflows turn out to
-need shared history between language variants.)
+~~**Document identity includes language**: `("onboarding-guide", "en")`
+and `("onboarding-guide", "de")` are two independent documents with
+independent branch histories, not two branches of one document.~~
+**Superseded 2026-09-23 — see "REVISED: version/language model" below.**
+This was flagged at the time as the biggest assumption in the design,
+explicitly pending revisit "if translation workflows turn out to need
+shared history between language variants" — that revisit happened, and
+the assumption was wrong. Left here, struck through, for the same reason
+this project keeps every other corrected misreading on record rather than
+quietly rewriting history (see CLAUDE.md's "no guessing, ever" section).
 
-**Branch ref naming stays self-describing**, not just index-dependent:
-`refs/heads/docs/<docId>/<language>/<branchName>` — so "all branches of a
-doc" is still answerable directly from git as a defense-in-depth check
-against the index (see consistency note below), not solely from Postgres.
+~~**Branch ref naming stays self-describing**, not just index-dependent:
+`refs/heads/docs/<docId>/<language>/<branchName>`~~ — the ref shape
+changed too (language dropped from it entirely); see the revision below
+for the current one. The *principle* — ref naming stays self-describing,
+not solely dependent on the index — still holds, only the shape changed.
 
 **Descriptive metadata (doc title, etc.) lives in git too, written once,
 not only in Postgres**: a `<docId>.meta.json` committed at
@@ -410,6 +415,58 @@ itself carries it. The same idea extends to the customer level — a
 a nice side effect: even a fully-lost `customers` table becomes
 reconstructable by scanning `/data/repos/**/*.git` and reading each repo's
 own metadata file, not just its documents/branches.
+
+### REVISED 2026-09-23: version/language model, readable IDs (built, live)
+
+Two real design changes from real usage, both implemented and verified
+against the live stack (not just discussed) — see "Java scaffolding"
+below for the verification detail.
+
+**A version (branch) is a unit of change that may touch several
+languages over its lifetime, not a per-language branch namespace.** The
+actual workflow: an existing master document changes at some point in
+time, and that change must eventually be reflected in every translated
+version too — sooner or later, not necessarily all at once. A version
+typically starts by changing one language (often master's own) and picks
+up translations incrementally as they're done, all within the *same*
+version, until merging to master means "every language is ready to ship,
+finalize and freeze." Keeping one commit as the bracket around every
+language's state at that point is what makes that in-flight, partially-
+translated state coherent — splitting it across independent per-language
+branches would mean tracking and eventually reconciling N separate
+histories for what's really one unit of work.
+
+Concretely: `DocumentRef` shrank from `(customerId, docId, language)` to
+just `(customerId, docId)` — language is no longer part of document
+identity, it's a parameter alongside `versionName` on the content methods
+(`load`/`save`/`merge`) instead, since it's a property of what a
+version's tree currently contains, not of which branch history it
+belongs to. Ref naming dropped the language segment:
+`refs/heads/docs/<docId>/<versionName>`. Tree layout: `<docId>/meta.json`
+is now document-level (not per-language), sitting alongside however many
+`<docId>/<language>/{content.ydoc,content.md,changelog.jsonl}`
+subdirectories that version's tree currently has — which can differ
+commit to commit as translations land. `GitDocumentStorageService`'s
+existing `buildTreeWithOverride` (carries forward every path not being
+overridden) already made this work with zero changes to that method —
+languages coexisting and evolving independently within one version falls
+out of it for free. A new `listLanguages(doc, versionName)` walks a
+version's tree (JGit `TreeWalk.forPath` positioned at the doc directory,
+then a non-recursive child walk) to answer "which languages does this
+version have."
+
+**Customer and document IDs are readable, git-URL-friendly slugs (e.g.
+`acme-corp`), not UUIDs** — the repo directory name itself
+(`/data/repos/<customerId>.git`) is human-legible, matching what a repo
+listing should look like. This also **dropped the sharding scheme**
+entirely (`/data/repos/<id[0:2]>/<id>.git` → flat `/data/repos/<id>.git`):
+sharding by a readable name's leading characters clusters badly (company
+names aren't uniformly distributed the way a UUID's random bytes are),
+and a flat directory of a few hundred repos is fine on any modern
+filesystem — not worth a hash-based sharding scheme to solve a problem
+that doesn't meaningfully exist at this scale. `Customer.id` (the Postgres
+entity) changed from `UUID` to `String` to match, and `CustomerMeta`
+dropped its now-redundant separate `slug` field (the id *is* the slug).
 
 ### Reconciliation sweep (addendum, agreed but not yet built)
 
@@ -440,87 +497,96 @@ needs attention.
 
 ### Postgres schema
 
+Updated 2026-09-23 to match the revised version/language model above —
+`documents` dropped its `language` column/constraint entirely (language
+moved to being a `branches`-adjacent concern, discoverable per-version via
+`listLanguages`, not a Postgres-indexed dimension yet — see "Open topics"),
+and `customers.id` is the readable slug itself (`TEXT`, no separate `slug`
+or `repo_path` columns — the latter is trivially `'/data/repos/' || id ||
+'.git'`, not worth storing):
+
 ```sql
 CREATE TABLE customers (
-  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  slug         TEXT NOT NULL UNIQUE,
+  id           TEXT PRIMARY KEY,       -- readable, git-URL-friendly (e.g. "acme-corp")
   display_name TEXT NOT NULL,
-  repo_path    TEXT NOT NULL UNIQUE,   -- /data/repos/ab/<id>.git
   status       TEXT NOT NULL DEFAULT 'provisioning', -- provisioning | ready | archived
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE documents (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  customer_id UUID NOT NULL REFERENCES customers(id),
+  customer_id TEXT NOT NULL REFERENCES customers(id),
   doc_id      TEXT NOT NULL,           -- stable slug, e.g. "onboarding-guide"
-  language    TEXT NOT NULL,           -- BCP-47, e.g. "en", "de", "fr-CA"
   title       TEXT,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (customer_id, doc_id, language)
+  UNIQUE (customer_id, doc_id)
 );
 
 CREATE TABLE branches (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   document_id     UUID NOT NULL REFERENCES documents(id),
-  branch_name     TEXT NOT NULL,       -- leaf name, e.g. "review-q3"
-  git_ref         TEXT NOT NULL,       -- refs/heads/docs/onboarding-guide/en/review-q3
+  version_name    TEXT NOT NULL,       -- leaf name, e.g. "review-q3"
+  git_ref         TEXT NOT NULL,       -- refs/heads/docs/onboarding-guide/review-q3
   is_default      BOOLEAN NOT NULL DEFAULT false,
   head_commit_sha TEXT,                -- kept in sync by persistence-service after every write
   created_by      TEXT,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (document_id, branch_name)
+  UNIQUE (document_id, version_name)
 );
 
 CREATE INDEX idx_documents_customer ON documents(customer_id);
-CREATE INDEX idx_documents_language ON documents(customer_id, language);
 CREATE INDEX idx_branches_document  ON branches(document_id);
 ```
 
 This directly answers the three motivating queries as plain joins, no
-ref-name parsing at query time: branches for a customer is
+ref-name parsing at query time: versions for a customer is
 `branches JOIN documents … WHERE customer_id = ?`; docs for a customer is
-`documents WHERE customer_id = ? [AND language = ?]`; branches of a doc is
+`documents WHERE customer_id = ?`; versions of a doc is
 `branches WHERE document_id = ?`.
 
 ### New API surface (on `persistence-service`)
 
-- **Customer/repo lifecycle**: `createCustomer(slug, displayName)` — this
-  is the `createRepo(Customer)` from the original ask, folded into one
-  call rather than split in two: inserts the row as `provisioning`,
-  `git init`s the repo at the computed sharded path, flips to `ready`. A
-  two-phase status column instead of a separate call means a crash
-  mid-provisioning is visible and retryable rather than silently
-  inconsistent. Plus `getCustomer`, `listCustomers(filter?)`,
-  `archiveCustomer` (soft-delete only — hard repo deletion stays a
-  separate, explicitly-confirmed operation, same caution as the 2026-09-22
-  volume wipe below).
+- **Customer/repo lifecycle**: `createCustomer(customerId, displayName)` —
+  `customerId` is caller-supplied (the readable slug), not generated —
+  folds what was originally asked as `createRepo(Customer)` into one call:
+  inserts the row as `provisioning`, `git init`s the repo at
+  `/data/repos/<customerId>.git`, flips to `ready`. A two-phase status
+  column instead of a separate call means a crash mid-provisioning is
+  visible and retryable rather than silently inconsistent. Plus
+  `getCustomer`, `listCustomers(filter?)`, `archiveCustomer` (soft-delete
+  only — hard repo deletion stays a separate, explicitly-confirmed
+  operation, same caution as the 2026-09-22 volume wipe below).
 - **Document lifecycle**: `createDocument(DocumentRef, meta)` — one git
-  commit seeding an empty initial "master" version and recording identity
-  together (see "Java scaffolding" below for why these aren't two
-  separate calls), plus the matching Postgres rows. Plus
-  `listDocuments(customerId, {language?})`, `getDocument(customerId,
-  docId, language)`.
-- **Branch lifecycle**: `createVersion(DocumentRef, versionName,
+  commit seeding an empty master version (no language content yet) and
+  recording identity together (see "REVISED" above for why these aren't
+  two separate calls), plus the matching Postgres rows. Plus
+  `listDocuments(customerId)`, `getDocument(customerId, docId)` — neither
+  takes a language filter anymore, since language isn't part of document
+  identity.
+- **Version lifecycle**: `createVersion(DocumentRef, versionName,
   fromVersionName)`, `deleteVersion(DocumentRef, versionName)` (renamed
   from createBranch/deleteBranch during implementation — "branch" only
   survives where it's genuinely git-specific now; we had no equivalent of
   delete at all before this RFC — the 2026-09-22 "reset everything"
   request had to fall back to a full Docker volume wipe because no
-  branch-delete API existed), `listBranches(customerId, {docId?,
-  language?})` (the general-purpose query behind all three motivating
-  lookups), and `mergeBranch(DocumentRef, source, target, author)` — same
-  conflict logic `conflicts.js` already has, scoped to the customer's repo.
-- **Content**: `load(DocumentRef, versionName)`/`save(DocumentRef,
-  versionName, ...)` — `save` additionally updates
-  `branches.head_commit_sha` and `documents.updated_at` after the git
-  write succeeds.
+  branch-delete API existed), `listBranches(customerId, docId?)` (the
+  general-purpose query behind all three motivating lookups), and
+  `mergeBranch(DocumentRef, source, target, language, author)` — same
+  conflict logic `conflicts.js` already has, scoped to the customer's repo
+  and one language within that version.
+- **Languages**: `listLanguages(DocumentRef, versionName)` — new, not
+  Postgres-backed at all (see "Open topics"): walks that version's tree
+  directly.
+- **Content**: `load(DocumentRef, versionName, language)`/
+  `save(DocumentRef, versionName, language, ...)` — `save` additionally
+  updates `branches.head_commit_sha` and `documents.updated_at` after the
+  git write succeeds.
 
-`DocumentRef(customerId, docId, language)` bundles what used to be three
-repeated string parameters on nearly every method above — see "Java
-scaffolding" below.
+`DocumentRef(customerId, docId)` bundles the two-string identity that
+used to be repeated across nearly every method above — see "REVISED"
+above for why it no longer includes language.
 
 ### Consistency caveat
 
@@ -547,18 +613,28 @@ filesystem clone at all; it only talks to `persistence-service` over
 HTTP — there is exactly one copy of the repository, not a clone plus a
 working copy some other service reads from.
 
-### Java scaffolding exists and compiles — deliberately dormant, not wired in
+### Java scaffolding — storage layer now LIVE, index/orchestration layer still dormant
 
-The layered design above (`DocumentStorageService` interface hiding git
+**Status changed 2026-09-23: `GitDocumentStorageService` and a new
+`MultiTenantAdminController` are genuinely live**, serving real HTTP
+traffic behind a real UI (`admin-mt.html`) — not just compiled-but-unused
+scaffolding anymore. `DocumentIndexService`/`DocumentPersistenceCoordinator`/
+`OutboxWorker`/`GitReconciliationService` (the Postgres-backed layer)
+remain exactly as dormant as before — nothing about their status changed,
+only the git-storage layer graduated. See "Verified and working" below
+for what's actually been exercised against the live stack.
+
+The layered design (`DocumentStorageService` interface hiding git
 internals behind private methods, `DocumentIndexService` shielding the
 Postgres repositories, `DocumentPersistenceCoordinator` as the one place
 that sequences a git write then an index update, `OutboxWorker` and
 `GitReconciliationService` for the two failure-recovery tiers) is written
 as real, final-shape Java under `backend/persistence-service/src/main/
-java/.../persistence/{storage,index,orchestration,reconcile}/` — not
+java/.../persistence/{storage,index,orchestration,reconcile}/` plus the
+live `MultiTenantAdminController` directly under `.../persistence/` — not
 pseudocode. Verified by actually compiling it (`docker build --target
 build`, a separate tag from the live image, never touching the running
-container) after every change below, not just the first pass: all 25
+container) after every change below, not just the first pass: all 26
 source files build clean, jar packages, Spring Boot repackages.
 
 **Refined through several rounds of real feedback after the first pass**,
@@ -608,11 +684,11 @@ each verified by recompiling, not just eyeballed:
   see "Open topics" below for the two spots (`Branch.headCommitSha`,
   `MergeOutcome.commitId`) explicitly left as-is or still undecided.
 
-**Deliberately not wired into the live request path yet**, per this
-project's own small-iterations rule — this is new architecture, and the
-currently-running single-tenant git-only app (`GitRepositoryService`,
-`DocumentController`) is completely untouched, not modified or replaced.
-Concretely:
+**The Postgres/index/orchestration layer stays deliberately dormant**, per
+this project's own small-iterations rule — only the git-storage layer
+went live, and even that never touched the currently-running single-tenant
+app (`GitRepositoryService`, `DocumentController`), which is completely
+untouched, not modified or replaced. Concretely:
 - `spring-boot-starter-data-jpa` + the Postgres driver were added to
   `pom.xml` so the index/orchestration/reconciliation layer compiles as
   real JPA code, but `application.yml` explicitly excludes
@@ -621,32 +697,57 @@ Concretely:
   starter on the classpath makes Spring Boot try to auto-create a
   `DataSource` at startup with no Postgres container to point at, which
   would have broken the currently-running app the next time it restarts.
-- `GitDocumentStorageService` is `@Service`-annotated (safe — its only
-  dependency is a config path, nothing missing), coexisting as a second,
-  independent bean alongside the existing untouched `GitRepositoryService`.
+- `GitDocumentStorageService` is `@Service`-annotated and **now actually
+  used** — `MultiTenantAdminController` (new, also directly under
+  `.../persistence/`) depends on it directly, bypassing
+  `DocumentIndexService`/`DocumentPersistenceCoordinator` entirely on
+  purpose (STATE.md's own explicit scoping: "omit postgres and all other
+  stuff right now, just make admin-ui compatible with existing classes").
+  Customer/document/version/language listing is derived live from git on
+  every request (`listCustomerIds`/`listAllRefs`/`listLanguages`) — real,
+  verified behavior at this prototype's scale, not the fast indexed path
+  the full RFC design eventually wants.
   `DocumentIndexServiceImpl`, `DocumentPersistenceCoordinator`,
-  `OutboxWorker`, and `GitReconciliationService` are deliberately **not**
-  Spring-annotated yet — they depend on the Spring Data repository beans
-  that don't exist while JPA autoconfiguration stays excluded, and
+  `OutboxWorker`, and `GitReconciliationService` are still deliberately
+  **not** Spring-annotated — they depend on the Spring Data repository
+  beans that don't exist while JPA autoconfiguration stays excluded, and
   `@SpringBootApplication`'s default component scan would otherwise try to
   instantiate them at boot regardless of whether any controller calls
-  them, failing startup. The remaining wiring step, once a real Postgres
-  container exists and the exclusion is lifted, is exactly two things:
-  add `@Service`/`@Component` to those four classes, and point
-  `DocumentController` (or a new controller) at
-  `DocumentPersistenceCoordinator`/`DocumentIndexService` instead of
-  `GitRepositoryService` directly. Nothing about the classes' internal
-  logic needs to change for that step.
+  them, failing startup. The remaining wiring step for *that* layer, once
+  a real Postgres container exists and the exclusion is lifted, is
+  unchanged from before: add `@Service`/`@Component` to those four
+  classes, and point a controller at `DocumentPersistenceCoordinator`/
+  `DocumentIndexService`.
 - Two real bugs were caught and fixed during the first pass by actually
   compiling and reasoning through the write paths, not just writing code
-  and reading it back: `Customer`'s client-assigned UUID id (needed before
-  the first save, to derive the sharded repo path) made Spring Data JPA's
-  default insert-vs-update detection wrong until it was made to implement
-  `Persistable<UUID>` explicitly; and `upsertBranch`/`upsertDocument`
-  originally saved the caller's fresh transient instance directly, which
-  would have collided with the unique constraint on every call after the
-  first for the same branch/document — fixed to look up the existing row
-  by natural key and update it in place.
+  and reading it back: `Customer`'s client-assigned id (needed before the
+  first save, to derive the repo path) made Spring Data JPA's default
+  insert-vs-update detection wrong until it was made to implement
+  `Persistable` explicitly; and `upsertBranch`/`upsertDocument` originally
+  saved the caller's fresh transient instance directly, which would have
+  collided with the unique constraint on every call after the first for
+  the same version/document — fixed to look up the existing row by
+  natural key and update it in place.
+- **A missing persistent volume, found the hard way (2026-09-23)**: the
+  `docker-compose.yml` volume for the single-tenant repo (`repo-data:
+  /data/repo`) was never mirrored for the new multi-tenant repo root
+  (`/data/repos`, plural) — every customer repo created by
+  `MultiTenantAdminController` was living only in `persistence-service`'s
+  ephemeral container layer and would have vanished on the next rebuild.
+  Caught while verifying `listLanguages` (below), not by inspection —
+  fixed by adding a `repos-data:/data/repos` volume, same pattern as the
+  existing one.
+- **`listLanguages` verified against real, independently-created git
+  content, not just its own round-trip** — and that verification surfaced
+  a real testing-methodology hazard worth recording: injecting content via
+  an external C-git client (`alpine/git`) into the same bare-ish repo
+  *while* `persistence-service` (JGit) was still running produced a
+  corrupted ref state (refs silently vanished). Stopping
+  `persistence-service` first, injecting via the external client against
+  a fully idle repo, then restarting, worked cleanly and is now the
+  established pattern for this kind of cross-implementation verification —
+  never mix JGit and a live C-git process against the same repo
+  concurrently, even read-only-looking operations.
 
 ### Open topics on the RFC scaffolding (deliberately unresolved — read before touching this code)
 
@@ -706,6 +807,115 @@ thread isn't picked back up for a while:
 
 ## Verified and working
 
+- Multi-tenant admin prototype (`admin-mt.html`, `MultiTenantAdminController`,
+  `GitDocumentStorageService`) — customer creation (readable id + display
+  name), customer deletion (`deleteCustomer`, `DELETE /api/mt/customers/
+  {customerId}`), document creation, version create/delete (master
+  protected), and language listing per version, all live and derived
+  straight from git (no Postgres). Verified end-to-end: full curl
+  lifecycle tests, real headless-browser interaction through the actual
+  UI panels, and `listLanguages` specifically checked against content
+  injected by an independent git client (not just round-tripped through
+  this app's own write path) — see "Java scaffolding" above for the
+  corruption hazard that verification surfaced and how it was worked
+  around.
+  - Unlike `deleteVersion` (which refuses to delete `master`, since that
+    would orphan a document's history), `deleteCustomer` has no
+    equivalent guard — deleting a whole customer takes everything
+    (every document, version, and commit) with it atomically by design,
+    since there's nothing left to orphan. The confirmation dialog in
+    `admin-mt.js` is the only safety net, and its wording spells out the
+    full blast radius rather than reusing `deleteVersion`'s shorter text.
+  - Verified via curl: created a customer with a document in it, deleted
+    the customer, confirmed it's gone from `GET /customers` and its repo
+    directory is actually removed from `/data/repos` on disk (not just
+    hidden from listings). Verified via headless Playwright: create →
+    select → delete button → confirm-dialog text asserted → dropdown
+    updates → result message shows.
+  - Side finding, not fixed (pre-existing, not introduced by this
+    change): `GET /customers/{customerId}/documents` for a customerId
+    with no repo (e.g. right after deletion, or just a typo) returns
+    HTTP 500 rather than 404/empty — `listAllRefs`/`listDocuments`
+    assume the repo exists and throw if it's missing. Not currently
+    reachable from the UI (the dropdown only ever holds real customer
+    ids), so left as-is rather than fixed speculatively.
+- **Live editor now reaches multi-tenant documents, not just the
+  single-tenant repo** (2026-09-23) — closes the gap the multi-tenant admin
+  prototype above left open: until now, `GitDocumentStorageService` had
+  metadata endpoints (customers/documents/versions/languages) but no
+  content load/save, so the real-time editor (`frontend/src/main.js`,
+  `collab-server`) had no way to reach anything created via `admin-mt.html`
+  at all, and its branch dropdown only ever showed the untouched
+  single-tenant repo's own branches (just `master`) — which is what
+  actually prompted this, reported as "the Editor UI stopped working."
+  - New content endpoints on `MultiTenantAdminController`: `GET`/`PUT
+    .../versions/{versionName}/languages/{language}/content`, wrapping
+    `GitDocumentStorageService.load`/`save` directly (ydoc as base64, same
+    shape as the single-tenant `DocumentController` endpoints). Language
+    is a real parameter here but the live editor always passes a fixed
+    `"en"` for now — no multi-language editing UI exists yet (explicit
+    scope call: adding a 4th cascading dropdown was the other option,
+    deferred since nothing needs it yet).
+  - `collab-server`: `persistenceClient.js` gained
+    `loadTenantSnapshot`/`saveTenantSnapshot` as parallel functions
+    alongside the existing `loadSnapshot`/`saveSnapshot`, rather than
+    branching inside them — keeps the long-working single-tenant path
+    untouched. `server.js`'s `parseDocumentName` now recognizes an `"mt:"`-
+    prefixed room name (`mt:<customerId>~<docId>@<versionName>`) alongside
+    the historical `<docId>@<branch>` shape, and every call site that used
+    to destructure `{docId, branch}` now spreads `parseDocumentName(...)`
+    into the live-document entry so both shapes flow through
+    `onLoadDocument`/`checkpointToGit`/`reconcileFastTierOnStartup`
+    unchanged.
+  - `frontend/src/main.js`: the branch dropdown is now one flattened list
+    covering both the legacy single-tenant branches (`(legacy
+    single-tenant) master`) and every multi-tenant customer/document/
+    version combination (`<displayName> / <docId> / <versionName>`),
+    fetched by walking `/api/mt/customers` → `.../documents` →
+    `.../versions` and flattening client-side — a cascading picker would
+    be more complete but a flattened list was explicitly agreed as enough
+    for testing. Selecting an entry now sets a `?doc=` URL param (not
+    `?branch=`); legacy keys are translated back to the historical
+    `default@<branch>` room name before reaching Hocuspocus, so
+    `collab-server`'s single-tenant path never sees anything new.
+  - **Real bug caught by testing, not by reasoning about the code**: the
+    first version of the `mt:` room-name format used `/` between
+    customerId and docId (`mt:acme-corp/onboarding-guide@master`).
+    `documentName` doubles as a fast-tier filename in `localStore.js`
+    (`path.join(LIVE_STORE_PATH, documentName + '.updates.log')`), so that
+    `/` silently became an unintended, nonexistent nested directory —
+    `onStoreDocument`/`afterUnloadDocument` failed with `ENOENT` every
+    time, caught only because the real headless-browser test actually
+    waited for the debounce and checked the logs, not from a curl check
+    or reading the diff. Fixed by switching the separator to `~`
+    (customerId/docId are git-URL-friendly slugs and never contain `~` in
+    practice) — re-verified clean afterward: typed content survived the
+    debounce → fast-tier compact → git checkpoint → and read back from
+    `GitDocumentStorageService` as real, decodable Yjs update bytes (not
+    just non-empty bytes).
+- **cgit (`git-frontend`) now shows multi-tenant repos, not just the
+  single-tenant one** (2026-09-23) — reported as "cgit does not show
+  branches cust-001-doc-001-ver-001, no save after 60 seconds." The save
+  itself was never broken (`collab-server` logs showed real
+  `git-checkpoint` commits landing, and the content endpoint returned real,
+  substantial Yjs bytes) — the user just had no way to see it, since
+  `git-frontend` only ever mounted `repo-data:/data/repo` and `cgitrc`
+  hardcoded exactly one static `repo.url=default` entry, with zero
+  awareness that `/data/repos/*.git` (the multi-tenant repos) existed at
+  all. Fixed by mounting `repos-data:/data/repos:ro` into `git-frontend`
+  alongside the existing single-tenant mount, and adding `scan-path=
+  /data/repos` to `cgitrc` — cgit's own tree-scan already understands a
+  non-bare repo (finds the nested `.git` and registers the parent
+  directory), same layout `/data/repo` already uses, so no directory
+  restructuring was needed. New customers show up automatically as they're
+  created, no per-customer cgit entry or redeploy required. Verified via
+  curl against the deployed container: the repo list now includes
+  `cust-001.git` alongside `default`, and its refs page lists
+  `cust-001-doc-001-ver-001`. `remove-suffix=1` was added to strip the
+  `.git` suffix from auto-discovered names for display but doesn't
+  currently take effect (repos still list as `cust-001.git` rather than
+  `cust-001`) — cosmetic only, left as a known minor quirk rather than
+  chased further.
 - Realtime collaboration: TipTap + Yjs + Hocuspocus, multiple browser tabs,
   live remote cursors with per-user color/label.
 - Sequential `User-N` identity, assigned by `collab-server`.

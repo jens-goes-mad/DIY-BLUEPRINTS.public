@@ -61,20 +61,18 @@ public class DocumentIndexServiceImpl implements DocumentIndexService {
   }
 
   @Override
-  public Optional<Customer> getCustomer(UUID customerId) {
+  public Optional<Customer> getCustomer(String customerId) {
     return customers.findById(customerId);
   }
 
   @Override
-  public List<Document> listDocuments(UUID customerId, String languageOrNull) {
-    return languageOrNull == null
-        ? documents.findByCustomerId(customerId)
-        : documents.findByCustomerIdAndLanguage(customerId, languageOrNull);
+  public List<Document> listDocuments(String customerId) {
+    return documents.findByCustomerId(customerId);
   }
 
   @Override
-  public Optional<Document> getDocument(UUID customerId, String docId, String language) {
-    return documents.findByCustomerIdAndDocIdAndLanguage(customerId, docId, language);
+  public Optional<Document> getDocument(String customerId, String docId) {
+    return documents.findByCustomerIdAndDocId(customerId, docId);
   }
 
   @Override
@@ -88,8 +86,7 @@ public class DocumentIndexServiceImpl implements DocumentIndexService {
       return customers.save(customer);
     } catch (Exception e) {
       queuePending("customer_upserted", Map.of(
-          "id", customer.getId().toString(), "slug", customer.getSlug(),
-          "displayName", customer.getDisplayName(), "repoPath", customer.getRepoPath()), e);
+          "id", customer.getId(), "displayName", customer.getDisplayName()), e);
       return customer;
     }
   }
@@ -101,17 +98,15 @@ public class DocumentIndexServiceImpl implements DocumentIndexService {
       // transient Document every time, including on what's semantically
       // an update -- find the real managed row by natural key first so a
       // repeat call updates it in place instead of colliding with the
-      // (customerId, docId, language) unique constraint on a blind insert.
-      Document toSave = documents.findByCustomerIdAndDocIdAndLanguage(
-              document.getCustomerId(), document.getDocId(), document.getLanguage())
+      // (customerId, docId) unique constraint on a blind insert.
+      Document toSave = documents.findByCustomerIdAndDocId(document.getCustomerId(), document.getDocId())
           .orElse(document);
       toSave.touch();
       return documents.save(toSave);
     } catch (Exception e) {
       queuePending("document_upserted", Map.of(
-          "customerId", document.getCustomerId().toString(),
+          "customerId", document.getCustomerId(),
           "docId", document.getDocId(),
-          "language", document.getLanguage(),
           "title", String.valueOf(document.getTitle())), e);
       return document;
     }

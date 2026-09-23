@@ -27,13 +27,27 @@ import java.util.Optional;
 
 /**
  * The one real implementation of DocumentStorageService: one bare-in-spirit
- * git repo per customer (RFC: multi-tenant scale, STATE.md), sharded on
- * disk to avoid one flat directory at scale:
- * <reposRoot>/<customerId[0:2]>/<customerId>.git. Same pure
- * object-database-plumbing approach as the existing single-repo
+ * git repo per customer (RFC: multi-tenant scale, STATE.md), directly at
+ * <reposRoot>/<customerId>.git -- customerId is itself a readable,
+ * git-URL-friendly slug (e.g. "acme-corp"), not a UUID, so the repo
+ * listing on disk is human-legible; no sharding, since sharding by a
+ * readable name's leading characters would cluster badly (company names
+ * aren't uniformly distributed the way random IDs are), and a flat
+ * directory of a few hundred repos is fine on any modern filesystem. Same
+ * pure object-database-plumbing approach as the existing single-repo
  * GitRepositoryService (never touches a working tree -- see that class's
  * javadoc for the 2026-09-19 incident this pattern avoids), generalized to
- * (DocumentRef, versionName) instead of a single fixed repo and (docId, branch).
+ * (DocumentRef, versionName, language) instead of a single fixed repo and
+ * (docId, branch).
+ *
+ * A version (branch) is a unit of change that may touch several languages
+ * over its lifetime, not a per-language branch namespace -- see
+ * DocumentRef's javadoc for the full reasoning. Concretely: refs are
+ * refs/heads/docs/<docId>/<versionName> (no language segment), and the
+ * tree layout is <docId>/meta.json (document-level identity) plus
+ * <docId>/<language>/{content.ydoc,content.md,changelog.jsonl} for
+ * however many languages that version's tree currently has -- which can
+ * differ commit to commit as translations land incrementally.
  *
  * This is also where every git-specific detail behind the interface's
  * generic contract actually lives, kept out of DocumentStorageService's
@@ -42,32 +56,32 @@ import java.util.Optional;
  * logic without a real git repo on disk, and callers never need to know
  * or care that git is the implementation underneath. Concretely:
  * initCustomer() is a git init plus a commit recording CustomerMeta;
- * createDocument() is one commit seeding an empty initial version plus
+ * createDocument() is one commit seeding an empty master version plus
  * DocumentMeta, in the same tree -- both fold what used to be two
  * separately-callable primitives (init/createVersion and a standalone meta
  * write) into one, since a caller never legitimately wants one without
  * the other, and exposing them separately only invited leaking *how* git
  * durably records identity (a file every branch inherits via ordinary
- * ancestry) as if that were itself a generic operation. readDocumentMeta()
- * and listAllRefs(), below, are deliberately NOT part of
- * DocumentStorageService at all -- same as findMergeBase -- since they're
- * inherently git-specific and their only consumer, GitReconciliationService,
- * is itself explicitly typed to this concrete class rather than the
- * generic interface (see that class's javadoc).
+ * ancestry) as if that were itself a generic operation. readDocumentMeta(),
+ * listCustomerIds(), listAllRefs(), and findMergeBase(), below, are
+ * deliberately NOT part of DocumentStorageService at all -- they're
+ * inherently git-specific and their only consumer, GitReconciliationService
+ * or MultiTenantAdminController, already depends on this concrete class
+ * rather than the generic interface.
  *
  * Every public method here funnels its body through unchecked() below,
  * which turns whatever checked exception JGit/Jackson/java.io actually
  * throws into a StorageException -- matches DocumentStorageService's own
  * javadoc on why the interface declares no checked exception. A
  * RuntimeException already thrown deliberately inside a method body (e.g.
- * "branch already exists") passes through unwrapped; only genuine checked
- * failures get wrapped.
+ * "version already exists") passes through unwrapped; only genuine
+ * checked failures get wrapped.
  *
  * Deliberately a completely separate bean from GitRepositoryService: this
  * class does not replace it, and DocumentController still talks to
  * GitRepositoryService/the single "repo.path" repo entirely unchanged.
  * This is new, additive code -- see STATE.md's RFC section for why it's
- * not yet wired into the live request path.
+ * not yet wired into the live editor's request path.
  */
 @Service
 public class GitDocumentStorageService implements DocumentStorageService {
@@ -111,8 +125,7 @@ public class GitDocumentStorageService implements DocumentStorageService {
   }
 
   private Path repoPath(String customerId) {
-    String shard = customerId.length() >= 2 ? customerId.substring(0, 2) : customerId;
-    return reposRoot.resolve(shard).resolve(customerId + ".git");
+    return reposRoot.resolve(customerId + ".git");
   }
 
   private Repository openRepo(String customerId) throws IOException {
@@ -122,12 +135,16 @@ public class GitDocumentStorageService implements DocumentStorageService {
   // Internal, git-specific naming is fine below this point -- only the
   // interface's own vocabulary needed to stay generic (see class javadoc).
 
-  private static String refName(DocumentRef doc, String branchName) {
-    return "refs/heads/docs/" + doc.docId() + "/" + doc.language() + "/" + branchName;
+  private static String refName(DocumentRef doc, String versionName) {
+    return "refs/heads/docs/" + doc.docId() + "/" + versionName;
   }
 
   private static String docDir(DocumentRef doc) {
-    return doc.docId() + "/" + doc.language();
+    return doc.docId();
+  }
+
+  private static String languageDir(DocumentRef doc, String language) {
+    return doc.docId() + "/" + language;
   }
 
   @Override
@@ -156,22 +173,17 @@ public class GitDocumentStorageService implements DocumentStorageService {
 
   @Override
   public synchronized String createDocument(DocumentRef doc, DocumentMeta meta) {
-    return unchecked("failed to create document " + doc.docId() + "/" + doc.language(), () -> {
+    return unchecked("failed to create document " + doc.docId(), () -> {
       try (Repository repo = openRepo(doc.customerId())) {
         String ref = refName(doc, "master");
         ObjectId branchHead = repo.resolve(ref);
-        String dir = docDir(doc);
 
         try (ObjectInserter inserter = repo.newObjectInserter()) {
-          Map<String, ObjectId> overrides = new LinkedHashMap<>();
-          overrides.put(dir + "/meta.json", inserter.insert(Constants.OBJ_BLOB, JSON.writeValueAsBytes(meta)));
-          overrides.put(dir + "/content.ydoc", inserter.insert(Constants.OBJ_BLOB, new byte[0]));
-          overrides.put(dir + "/content.md", inserter.insert(Constants.OBJ_BLOB, new byte[0]));
-          overrides.put(dir + "/changelog.jsonl", inserter.insert(Constants.OBJ_BLOB, new byte[0]));
-
-          ObjectId newTreeId = buildTreeWithOverride(repo, inserter, branchHead, overrides);
-          ObjectId newCommitId = commit(repo, inserter, branchHead, newTreeId, "system",
-              "create document " + doc.docId() + "/" + doc.language());
+          // No language content yet -- languages get added incrementally
+          // via save() as translations land, all within this same version.
+          ObjectId blobId = inserter.insert(Constants.OBJ_BLOB, JSON.writeValueAsBytes(meta));
+          ObjectId newTreeId = buildTreeWithOverride(repo, inserter, branchHead, Map.of(docDir(doc) + "/meta.json", blobId));
+          ObjectId newCommitId = commit(repo, inserter, branchHead, newTreeId, "system", "create document " + doc.docId());
           updateBranchRef(repo, ref, branchHead, newCommitId);
           return newCommitId.getName();
         }
@@ -181,12 +193,28 @@ public class GitDocumentStorageService implements DocumentStorageService {
 
   /**
    * NOT part of the DocumentStorageService interface -- see this class's
+   * javadoc. Reads _customer.meta.json off master; used by
+   * MultiTenantAdminController to show a display name alongside each
+   * readable customerId in the admin UI's dropdown.
+   */
+  public Optional<CustomerMeta> readCustomerMeta(String customerId) {
+    return unchecked("failed to read metadata for customer " + customerId, () -> {
+      try (Repository repo = openRepo(customerId)) {
+        byte[] bytes = readBlob(repo, "refs/heads/master", "_customer.meta.json");
+        if (bytes == null) return Optional.empty();
+        return Optional.of(JSON.readValue(bytes, CustomerMeta.class));
+      }
+    });
+  }
+
+  /**
+   * NOT part of the DocumentStorageService interface -- see this class's
    * javadoc. Its only consumer, GitReconciliationService, recovers a
-   * document's title from whichever branch it's currently examining when
+   * document's title from whichever version it's currently examining when
    * no matching index row exists at all.
    */
   public Optional<DocumentMeta> readDocumentMeta(DocumentRef doc, String versionName) {
-    return unchecked("failed to read metadata for " + doc.docId() + "/" + doc.language(), () -> {
+    return unchecked("failed to read metadata for " + doc.docId(), () -> {
       try (Repository repo = openRepo(doc.customerId())) {
         byte[] bytes = readBlob(repo, refName(doc, versionName), docDir(doc) + "/meta.json");
         if (bytes == null) return Optional.empty();
@@ -196,10 +224,36 @@ public class GitDocumentStorageService implements DocumentStorageService {
   }
 
   @Override
-  public Optional<byte[]> load(DocumentRef doc, String versionName) {
-    return unchecked("failed to load " + doc.docId() + "/" + doc.language(), () -> {
+  public List<String> listLanguages(DocumentRef doc, String versionName) {
+    return unchecked("failed to list languages for " + doc.docId(), () -> {
       try (Repository repo = openRepo(doc.customerId())) {
-        byte[] bytes = readBlob(repo, refName(doc, versionName), docDir(doc) + "/content.ydoc");
+        ObjectId commitId = repo.resolve(refName(doc, versionName));
+        List<String> languages = new ArrayList<>();
+        if (commitId == null) return languages;
+
+        try (RevWalk revWalk = new RevWalk(repo)) {
+          RevCommit commit = revWalk.parseCommit(commitId);
+          try (TreeWalk docWalk = TreeWalk.forPath(repo, docDir(doc), commit.getTree())) {
+            if (docWalk == null || !docWalk.isSubtree()) return languages;
+            try (TreeWalk childWalk = new TreeWalk(repo)) {
+              childWalk.addTree(docWalk.getObjectId(0));
+              childWalk.setRecursive(false);
+              while (childWalk.next()) {
+                if (childWalk.isSubtree()) languages.add(childWalk.getNameString());
+              }
+            }
+          }
+        }
+        return languages;
+      }
+    });
+  }
+
+  @Override
+  public Optional<byte[]> load(DocumentRef doc, String versionName, String language) {
+    return unchecked("failed to load " + doc.docId() + "/" + language, () -> {
+      try (Repository repo = openRepo(doc.customerId())) {
+        byte[] bytes = readBlob(repo, refName(doc, versionName), languageDir(doc, language) + "/content.ydoc");
         return Optional.ofNullable(bytes);
       }
     });
@@ -216,13 +270,13 @@ public class GitDocumentStorageService implements DocumentStorageService {
   }
 
   @Override
-  public synchronized String save(DocumentRef doc, String versionName,
+  public synchronized String save(DocumentRef doc, String versionName, String language,
                                    byte[] contentBytes, String markdown, String changelogJson, String author) {
-    return unchecked("failed to save " + doc.docId() + "/" + doc.language(), () -> {
+    return unchecked("failed to save " + doc.docId() + "/" + language, () -> {
       try (Repository repo = openRepo(doc.customerId())) {
         String ref = refName(doc, versionName);
         ObjectId branchHead = repo.resolve(ref);
-        String dir = docDir(doc);
+        String dir = languageDir(doc, language);
 
         try (ObjectInserter inserter = repo.newObjectInserter()) {
           Map<String, ObjectId> overrides = new LinkedHashMap<>();
@@ -231,9 +285,13 @@ public class GitDocumentStorageService implements DocumentStorageService {
           overrides.put(dir + "/changelog.jsonl",
               inserter.insert(Constants.OBJ_BLOB, (changelogJson == null ? "" : changelogJson).getBytes(StandardCharsets.UTF_8)));
 
+          // Every other language already in this version's tree, and the
+          // document's own meta.json, are carried forward untouched by
+          // buildTreeWithOverride -- this is exactly what lets languages
+          // coexist and evolve independently within one version.
           ObjectId newTreeId = buildTreeWithOverride(repo, inserter, branchHead, overrides);
           ObjectId newCommitId = commit(repo, inserter, branchHead, newTreeId, author,
-              "snapshot of " + doc.docId() + "/" + doc.language() + " by " + author);
+              "snapshot of " + doc.docId() + "/" + language + " by " + author);
           updateBranchRef(repo, ref, branchHead, newCommitId);
           return newCommitId.getName();
         }
@@ -308,16 +366,16 @@ public class GitDocumentStorageService implements DocumentStorageService {
 
   @Override
   public synchronized String createVersion(DocumentRef doc, String versionName, String fromVersionName) {
-    return unchecked("failed to create branch " + versionName + " for " + doc.docId() + "/" + doc.language(), () -> {
+    return unchecked("failed to create version " + versionName + " for " + doc.docId(), () -> {
       try (Repository repo = openRepo(doc.customerId())) {
         String sourceRef = refName(doc, fromVersionName);
         String newRef = refName(doc, versionName);
         ObjectId sourceId = repo.resolve(sourceRef);
         if (sourceId == null) {
-          throw new IllegalStateException("source branch not found: " + sourceRef);
+          throw new IllegalStateException("source version not found: " + sourceRef);
         }
         if (repo.resolve(newRef) != null) {
-          throw new IllegalStateException("branch already exists: " + newRef);
+          throw new IllegalStateException("version already exists: " + newRef);
         }
         updateBranchRef(repo, newRef, null, sourceId);
         return sourceId.getName();
@@ -327,10 +385,11 @@ public class GitDocumentStorageService implements DocumentStorageService {
 
   @Override
   public synchronized void deleteVersion(DocumentRef doc, String versionName) {
-    unchecked("failed to delete branch " + versionName + " for " + doc.docId() + "/" + doc.language(), () -> {
-      // "master" holds a document's primary content and every other
-      // version's history traces back to it -- same protection as
-      // GitRepositoryService.deleteBranch on the single-repo model.
+    unchecked("failed to delete version " + versionName + " for " + doc.docId(), () -> {
+      // "master" holds a document's shipped, all-languages-complete state
+      // and every other version's history traces back to it -- same
+      // protection as GitRepositoryService.deleteBranch on the
+      // single-repo model.
       if ("master".equals(versionName)) {
         throw new IllegalArgumentException("cannot delete the default version: " + versionName);
       }
@@ -347,21 +406,20 @@ public class GitDocumentStorageService implements DocumentStorageService {
   }
 
   @Override
-  public synchronized MergeOutcome merge(DocumentRef doc, String sourceVersionName, String targetVersionName,
+  public synchronized MergeOutcome merge(DocumentRef doc, String sourceVersionName, String targetVersionName, String language,
                                           byte[] mergedContentBytes, String mergedMarkdown, String author) {
-    return unchecked("failed to merge " + sourceVersionName + " into " + targetVersionName
-        + " for " + doc.docId() + "/" + doc.language(), () -> {
+    return unchecked("failed to merge " + sourceVersionName + " into " + targetVersionName + " for " + doc.docId(), () -> {
       try (Repository repo = openRepo(doc.customerId())) {
         String targetRef = refName(doc, targetVersionName);
         String sourceRef = refName(doc, sourceVersionName);
         ObjectId targetHead = repo.resolve(targetRef);
         ObjectId sourceHead = repo.resolve(sourceRef);
         if (targetHead == null || sourceHead == null) {
-          throw new IllegalStateException("both branches must exist: " + targetRef + ", " + sourceRef);
+          throw new IllegalStateException("both versions must exist: " + targetRef + ", " + sourceRef);
         }
 
         try (ObjectInserter inserter = repo.newObjectInserter()) {
-          String dir = docDir(doc);
+          String dir = languageDir(doc, language);
           Map<String, ObjectId> overrides = new LinkedHashMap<>();
           overrides.put(dir + "/content.ydoc", inserter.insert(Constants.OBJ_BLOB, mergedContentBytes));
           overrides.put(dir + "/content.md", inserter.insert(Constants.OBJ_BLOB, mergedMarkdown.getBytes(StandardCharsets.UTF_8)));
@@ -392,26 +450,21 @@ public class GitDocumentStorageService implements DocumentStorageService {
 
   /**
    * NOT part of the DocumentStorageService interface -- same category as
-   * listAllRefs/findMergeBase. Scans the sharded repos.root directory tree
-   * directly for every customer's .git directory -- there's no Postgres
-   * customer registry yet (see STATE.md's RFC section), so this is the
-   * only way to enumerate customers right now. Fine at admin-tool scale
-   * (a directory scan, not a query against thousands of rows); not meant
-   * to be the long-term answer once the index actually exists.
+   * listAllRefs/findMergeBase. Scans reposRoot directly for every
+   * customer's .git directory -- there's no Postgres customer registry
+   * yet (see STATE.md's RFC section), so this is the only way to
+   * enumerate customers right now. Fine at admin-tool scale (a directory
+   * scan, not a query against thousands of rows); not meant to be the
+   * long-term answer once the index actually exists.
    */
   public List<String> listCustomerIds() {
     return unchecked("failed to list customers", () -> {
       List<String> ids = new ArrayList<>();
       if (!Files.isDirectory(reposRoot)) return ids;
-      try (DirectoryStream<Path> shards = Files.newDirectoryStream(reposRoot)) {
-        for (Path shard : shards) {
-          if (!Files.isDirectory(shard)) continue;
-          try (DirectoryStream<Path> repos = Files.newDirectoryStream(shard, "*.git")) {
-            for (Path repo : repos) {
-              String name = repo.getFileName().toString();
-              ids.add(name.substring(0, name.length() - ".git".length()));
-            }
-          }
+      try (DirectoryStream<Path> repos = Files.newDirectoryStream(reposRoot, "*.git")) {
+        for (Path repo : repos) {
+          String name = repo.getFileName().toString();
+          ids.add(name.substring(0, name.length() - ".git".length()));
         }
       }
       return ids;
@@ -419,9 +472,37 @@ public class GitDocumentStorageService implements DocumentStorageService {
   }
 
   /**
+   * NOT part of the DocumentStorageService interface -- same category as
+   * listCustomerIds. A much bigger blast radius than deleteVersion:
+   * removes the customer's entire repo -- every document, every version,
+   * every commit -- not one ref. No "still has documents" guard the way
+   * deleteVersion protects "master": unlike deleting one version (which
+   * would orphan the rest of that document's history while the document
+   * still nominally exists), deleting a whole customer takes everything
+   * with it atomically by design, so there's nothing left to orphan.
+   * MultiTenantAdminController's confirmation dialog is the safety
+   * mechanism here, not a technical guard.
+   */
+  public synchronized void deleteCustomer(String customerId) {
+    unchecked("failed to delete customer " + customerId, () -> deleteRecursively(repoPath(customerId)));
+  }
+
+  private static void deleteRecursively(Path path) throws IOException {
+    if (!Files.exists(path)) return;
+    if (Files.isDirectory(path)) {
+      try (DirectoryStream<Path> children = Files.newDirectoryStream(path)) {
+        for (Path child : children) {
+          deleteRecursively(child);
+        }
+      }
+    }
+    Files.delete(path);
+  }
+
+  /**
    * NOT part of the DocumentStorageService interface -- see this class's
    * javadoc. Every ref under refs/heads/ to its tip commit SHA, for
-   * GitReconciliationService, the only caller.
+   * GitReconciliationService and MultiTenantAdminController.
    */
   public Map<String, String> listAllRefs(String customerId) {
     return unchecked("failed to list refs for customer " + customerId, () -> {
@@ -446,12 +527,12 @@ public class GitDocumentStorageService implements DocumentStorageService {
    * here too for symmetry/reuse once this class is actually wired in.
    */
   public String findMergeBase(DocumentRef doc, String versionA, String versionB) {
-    return unchecked("failed to find merge base for " + doc.docId() + "/" + doc.language(), () -> {
+    return unchecked("failed to find merge base for " + doc.docId(), () -> {
       try (Repository repo = openRepo(doc.customerId()); RevWalk revWalk = new RevWalk(repo)) {
         ObjectId aId = repo.resolve(refName(doc, versionA));
         ObjectId bId = repo.resolve(refName(doc, versionB));
         if (aId == null || bId == null) {
-          throw new IllegalStateException("both branches must exist: " + versionA + ", " + versionB);
+          throw new IllegalStateException("both versions must exist: " + versionA + ", " + versionB);
         }
         revWalk.setRevFilter(RevFilter.MERGE_BASE);
         revWalk.markStart(revWalk.parseCommit(aId));

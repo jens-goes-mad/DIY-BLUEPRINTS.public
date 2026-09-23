@@ -77,12 +77,12 @@ public class OutboxWorker {
   }
 
   private void applyCustomer(Map<String, String> p) {
-    // Reconstructed with the SAME client-assigned id the coordinator
-    // already used to create the actual git repo (see Customer.java) --
-    // generating a fresh id here instead would desync the Postgres row
-    // from the repo path that already exists on disk.
-    Customer customer = customers.findBySlug(p.get("slug"))
-        .orElseGet(() -> new Customer(UUID.fromString(p.get("id")), p.get("slug"), p.get("displayName"), p.get("repoPath")));
+    // id is the readable slug itself now (see Customer.java) -- the same
+    // one the coordinator already used to create the actual git repo, so
+    // looking it up directly by id is enough; no separate slug field to
+    // search by.
+    Customer customer = customers.findById(p.get("id"))
+        .orElseGet(() -> new Customer(p.get("id"), p.get("displayName")));
     // status isn't carried in the payload and defaults to PROVISIONING for
     // a brand-new row -- acceptable simplification for this pass; revisit
     // if a retried customer needs to preserve a status change too.
@@ -90,9 +90,9 @@ public class OutboxWorker {
   }
 
   private void applyDocument(Map<String, String> p) {
-    UUID customerId = UUID.fromString(p.get("customerId"));
-    Document document = documents.findByCustomerIdAndDocIdAndLanguage(customerId, p.get("docId"), p.get("language"))
-        .orElseGet(() -> new Document(customerId, p.get("docId"), p.get("language"), p.get("title")));
+    String customerId = p.get("customerId");
+    Document document = documents.findByCustomerIdAndDocId(customerId, p.get("docId"))
+        .orElseGet(() -> new Document(customerId, p.get("docId"), p.get("title")));
     documents.save(document);
   }
 

@@ -13,36 +13,90 @@ const DOC_ID = 'default'
 
 const CURSOR_COLORS = ['#f44336', '#2196f3', '#4caf50', '#ff9800', '#9c27b0', '#009688']
 
-function currentBranch() {
-  return new URLSearchParams(window.location.search).get('branch') || 'master'
+// One flattened dropdown covering both the legacy single-tenant branches
+// ("legacy:<branch>") and every multi-tenant customer/document/version
+// combo ("mt:<customerId>/<docId>@<versionName>") -- a cascading
+// customer->document->version picker (like admin-mt.js's) would be more
+// complete, but for testing this app against the new multi-tenant model
+// a single flat list is enough, and keeps the legacy path exercisable too.
+function currentDocKey() {
+  return new URLSearchParams(window.location.search).get('doc') || 'legacy:master'
 }
 
-async function populateBranchDropdown(branch) {
-  const select = document.getElementById('branch-select')
+// Translates a dropdown key into the actual Hocuspocus room name. The
+// legacy branch is folded back into the historical "default@branch" shape
+// so collab-server's existing single-tenant parseDocumentName path is
+// completely untouched; "mt:..." keys are passed straight through, since
+// that's exactly the room-name shape collab-server's new tenant branch
+// of parseDocumentName expects. Note the "~" (not "/") between
+// customerId and docId -- documentName doubles as a fast-tier filename in
+// collab-server's localStore.js, where a literal "/" would turn into an
+// unintended (and nonexistent) nested directory.
+function roomNameFor(docKey) {
+  if (docKey.startsWith('legacy:')) return `${DOC_ID}@${docKey.slice('legacy:'.length)}`
+  return docKey
+}
+
+async function fetchFlattenedDocEntries() {
+  const entries = []
+
   try {
-    const res = await fetch(`${PERSISTENCE_URL}/api/branches`)
-    const branches = await res.json()
-    if (!branches.includes(branch)) branches.push(branch)
-    select.innerHTML = ''
-    for (const b of branches.sort()) {
-      const option = document.createElement('option')
-      option.value = b
-      option.textContent = b
-      option.selected = b === branch
-      select.appendChild(option)
-    }
+    const branches = await (await fetch(`${PERSISTENCE_URL}/api/branches`)).json()
+    for (const b of branches.sort()) entries.push({ key: `legacy:${b}`, label: `(legacy single-tenant) ${b}` })
   } catch (err) {
-    console.error('failed to load branch list:', err.message)
-    select.innerHTML = `<option value="${branch}" selected>${branch}</option>`
+    console.error('failed to load legacy branch list:', err.message)
   }
 
-  // A branch is a different live-editing "room" (see collab-server's
-  // parseDocumentName) -- switching means reconnecting from scratch, which
-  // a full navigation gives us for free, no manual teardown of the
-  // editor/provider needed.
+  try {
+    const customers = await (await fetch(`${PERSISTENCE_URL}/api/mt/customers`)).json()
+    for (const c of customers) {
+      const docIds = await (
+        await fetch(`${PERSISTENCE_URL}/api/mt/customers/${encodeURIComponent(c.customerId)}/documents`)
+      ).json()
+      for (const docId of docIds) {
+        const versions = await (
+          await fetch(
+            `${PERSISTENCE_URL}/api/mt/customers/${encodeURIComponent(c.customerId)}/documents/` +
+              `${encodeURIComponent(docId)}/versions`,
+          )
+        ).json()
+        for (const v of versions) {
+          entries.push({
+            key: `mt:${c.customerId}~${docId}@${v}`,
+            label: `${c.displayName} / ${docId} / ${v}`,
+          })
+        }
+      }
+    }
+  } catch (err) {
+    console.error('failed to load multi-tenant document list:', err.message)
+  }
+
+  return entries
+}
+
+async function populateBranchDropdown(docKey) {
+  const select = document.getElementById('branch-select')
+  const entries = await fetchFlattenedDocEntries()
+  if (!entries.some((e) => e.key === docKey)) entries.push({ key: docKey, label: docKey })
+
+  select.innerHTML = ''
+  for (const e of entries) {
+    const option = document.createElement('option')
+    option.value = e.key
+    option.textContent = e.label
+    option.selected = e.key === docKey
+    select.appendChild(option)
+  }
+
+  // A branch/version is a different live-editing "room" (see
+  // collab-server's parseDocumentName) -- switching means reconnecting
+  // from scratch, which a full navigation gives us for free, no manual
+  // teardown of the editor/provider needed.
   select.addEventListener('change', () => {
     const url = new URL(window.location.href)
-    url.searchParams.set('branch', select.value)
+    url.searchParams.set('doc', select.value)
+    url.searchParams.delete('branch')
     window.location.href = url.toString()
   })
 }
@@ -66,17 +120,18 @@ async function uploadImage(file) {
 }
 
 async function main() {
-  const branch = currentBranch()
-  await populateBranchDropdown(branch)
+  const docKey = currentDocKey()
+  await populateBranchDropdown(docKey)
+  const roomName = roomNameFor(docKey)
 
   const res = await fetch(`${HTTP_URL}/api/whoami`)
   const { userId } = await res.json()
-  document.getElementById('user-badge').textContent = `You are: ${userId} — editing branch "${branch}"`
+  document.getElementById('user-badge').textContent = `You are: ${userId} — editing "${roomName}"`
 
   const ydoc = new Y.Doc()
   const provider = new HocuspocusProvider({
     url: WS_URL,
-    name: `${DOC_ID}@${branch}`,
+    name: roomName,
     document: ydoc,
     parameters: { userId },
   })

@@ -41,6 +41,12 @@ services:
       - "8081:8080"
     volumes:
       - repo-data:/data/repo
+      # Multi-tenant repo root (RFC: multi-tenant scale, STATE.md) --
+      # GitDocumentStorageService/MultiTenantAdminController's per-customer
+      # repos, separate from the single-tenant repo-data volume above.
+      # Without this, every customer repo lives only in the container's
+      # ephemeral writable layer and vanishes on the next rebuild/restart.
+      - repos-data:/data/repos
 
   git-frontend:
     restart: unless-stopped
@@ -50,6 +56,7 @@ services:
       - "8096:80"
     volumes:
       - repo-data:/data/repo:ro
+      - repos-data:/data/repos:ro
     depends_on:
       - persistence-service
 
@@ -198,6 +205,7 @@ services:
 
 volumes:
   repo-data:
+  repos-data:
   live-data:
   ak-pg-certs:
   ak-postgres-data:

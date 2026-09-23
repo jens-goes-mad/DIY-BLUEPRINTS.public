@@ -35,29 +35,25 @@ public class DocumentPersistenceCoordinator {
     this.index = index;
   }
 
-  public Customer createCustomer(String slug, String displayName) {
-    UUID id = UUID.randomUUID();
-    String repoPath = id.toString(); // GitDocumentStorageService derives the actual sharded path from the id itself
-
-    Customer customer = new Customer(id, slug, displayName, repoPath);
+  /** customerId is caller-supplied -- a readable, git-URL-friendly slug (e.g. "acme-corp"), not generated here. */
+  public Customer createCustomer(String customerId, String displayName) {
+    Customer customer = new Customer(customerId, displayName);
     index.upsertCustomer(customer); // status=PROVISIONING (entity default) -- visible-but-not-ready if this crashes here
 
-    storage.initCustomer(id.toString(), new CustomerMeta(id.toString(), slug, displayName));
+    storage.initCustomer(customerId, new CustomerMeta(customerId, displayName));
 
     customer.setStatus(Customer.Status.READY);
     return index.upsertCustomer(customer);
   }
 
   public Document createDocument(DocumentRef doc, String title) {
-    // Seeds an empty initial "master" version and records DocumentMeta in
-    // the same commit (see DocumentStorageService/GitDocumentStorageService
-    // javadoc for why these aren't two separate calls). Empty content is a
-    // placeholder for this sketch -- once this is wired to a real caller
-    // (collab-server), the actual initial Yjs state (which only Yjs itself
-    // can produce) belongs here instead.
-    String versionId = storage.createDocument(doc, new DocumentMeta(doc.docId(), doc.language(), title));
+    // Seeds an empty master version with just DocumentMeta -- no language
+    // content yet (see DocumentStorageService/GitDocumentStorageService
+    // javadoc: languages get added incrementally via save() as
+    // translations land, all within this same version).
+    String versionId = storage.createDocument(doc, new DocumentMeta(doc.docId(), title));
 
-    Document document = index.upsertDocument(new Document(UUID.fromString(doc.customerId()), doc.docId(), doc.language(), title));
+    Document document = index.upsertDocument(new Document(doc.customerId(), doc.docId(), title));
     Branch branch = new Branch(document.getId(), "master", gitRef(doc, "master"), true, "system");
     branch.setHeadCommitSha(versionId);
     index.upsertBranch(branch);
@@ -67,8 +63,8 @@ public class DocumentPersistenceCoordinator {
   public Branch createVersion(DocumentRef doc, String versionName, String fromVersionName) {
     String versionId = storage.createVersion(doc, versionName, fromVersionName);
 
-    UUID documentId = index.getDocument(UUID.fromString(doc.customerId()), doc.docId(), doc.language())
-        .orElseThrow(() -> new IllegalStateException("document not found in index: " + doc.docId() + "/" + doc.language()))
+    UUID documentId = index.getDocument(doc.customerId(), doc.docId())
+        .orElseThrow(() -> new IllegalStateException("document not found in index: " + doc.docId()))
         .getId();
     Branch branch = new Branch(documentId, versionName, gitRef(doc, versionName), false, "system");
     branch.setHeadCommitSha(versionId);
@@ -77,7 +73,7 @@ public class DocumentPersistenceCoordinator {
 
   public void deleteVersion(DocumentRef doc, String versionName) {
     storage.deleteVersion(doc, versionName);
-    UUID documentId = index.getDocument(UUID.fromString(doc.customerId()), doc.docId(), doc.language())
+    UUID documentId = index.getDocument(doc.customerId(), doc.docId())
         .map(Document::getId)
         .orElse(null);
     if (documentId != null) {
@@ -85,11 +81,11 @@ public class DocumentPersistenceCoordinator {
     }
   }
 
-  public String saveSnapshot(DocumentRef doc, String versionName,
+  public String saveSnapshot(DocumentRef doc, String versionName, String language,
                               byte[] contentBytes, String markdown, String changelogJson, String author) {
-    String versionId = storage.save(doc, versionName, contentBytes, markdown, changelogJson, author);
+    String versionId = storage.save(doc, versionName, language, contentBytes, markdown, changelogJson, author);
 
-    index.getDocument(UUID.fromString(doc.customerId()), doc.docId(), doc.language()).ifPresent(document -> {
+    index.getDocument(doc.customerId(), doc.docId()).ifPresent(document -> {
       Branch b = new Branch(document.getId(), versionName, gitRef(doc, versionName), "master".equals(versionName), author);
       b.setHeadCommitSha(versionId);
       index.upsertBranch(b);
@@ -97,13 +93,13 @@ public class DocumentPersistenceCoordinator {
     return versionId;
   }
 
-  public MergeOutcome mergeBranch(DocumentRef doc, String sourceVersionName, String targetVersionName,
+  public MergeOutcome mergeBranch(DocumentRef doc, String sourceVersionName, String targetVersionName, String language,
                                    byte[] mergedContentBytes, String mergedMarkdown, String author) {
-    MergeOutcome outcome = storage.merge(doc, sourceVersionName, targetVersionName,
+    MergeOutcome outcome = storage.merge(doc, sourceVersionName, targetVersionName, language,
         mergedContentBytes, mergedMarkdown, author);
 
     if (outcome.merged()) {
-      index.getDocument(UUID.fromString(doc.customerId()), doc.docId(), doc.language()).ifPresent(document -> {
+      index.getDocument(doc.customerId(), doc.docId()).ifPresent(document -> {
         Branch b = new Branch(document.getId(), targetVersionName, gitRef(doc, targetVersionName),
             "master".equals(targetVersionName), author);
         b.setHeadCommitSha(outcome.commitId());
@@ -114,6 +110,6 @@ public class DocumentPersistenceCoordinator {
   }
 
   private static String gitRef(DocumentRef doc, String versionName) {
-    return "refs/heads/docs/" + doc.docId() + "/" + doc.language() + "/" + versionName;
+    return "refs/heads/docs/" + doc.docId() + "/" + versionName;
   }
 }

@@ -62,23 +62,23 @@ public class GitReconciliationService {
   }
 
   public void reconcileCustomer(Customer customer) {
-    Map<String, String> observedRefs = storage.listAllRefs(customer.getId().toString()); // ref path -> tip SHA
+    Map<String, String> observedRefs = storage.listAllRefs(customer.getId()); // ref path -> tip SHA
 
     for (Map.Entry<String, String> entry : observedRefs.entrySet()) {
       RefParts parts = RefParts.parse(entry.getKey());
       if (parts == null) continue; // doesn't match our naming convention -- not one of ours, skip
 
-      Document document = index.getDocument(customer.getId(), parts.docId(), parts.language())
+      Document document = index.getDocument(customer.getId(), parts.docId())
           .orElseGet(() -> recoverDocument(customer, parts));
 
       Branch existing = index.listBranches(document.getId()).stream()
-          .filter(b -> b.getVersionName().equals(parts.branchName()))
+          .filter(b -> b.getVersionName().equals(parts.versionName()))
           .findFirst().orElse(null);
 
       String observedSha = entry.getValue();
       if (existing == null || !observedSha.equals(existing.getHeadCommitSha())) {
-        Branch branch = new Branch(document.getId(), parts.branchName(), entry.getKey(),
-            "master".equals(parts.branchName()), null);
+        Branch branch = new Branch(document.getId(), parts.versionName(), entry.getKey(),
+            "master".equals(parts.versionName()), null);
         branch.setHeadCommitSha(observedSha);
         index.upsertBranch(branch);
         log.info("[reconcile] {} branch {} -> {}", existing == null ? "recovered" : "corrected", entry.getKey(), observedSha);
@@ -86,7 +86,7 @@ public class GitReconciliationService {
     }
 
     // Deletion pass: any branch row whose ref no longer exists in git.
-    for (Document document : index.listDocuments(customer.getId(), null)) {
+    for (Document document : index.listDocuments(customer.getId())) {
       for (Branch branch : index.listBranches(document.getId())) {
         if (!observedRefs.containsKey(branch.getGitRef())) {
           index.deleteVersion(document.getId(), branch.getVersionName());
@@ -99,32 +99,33 @@ public class GitReconciliationService {
   /**
    * A branch ref with no matching Document row at all -- recovers full
    * identity, including title, from that branch's own meta.json (written
-   * once at document creation, inherited by every branch via ordinary git
-   * ancestry -- see DocumentMeta's javadoc). This is exactly the gap that
-   * writing metadata into git, not only Postgres, was decided to close.
+   * once at document creation, document-level not language-scoped,
+   * inherited by every version via ordinary git ancestry -- see
+   * DocumentMeta's javadoc). This is exactly the gap that writing
+   * metadata into git, not only Postgres, was decided to close.
    */
   private Document recoverDocument(Customer customer, RefParts parts) {
     String title = null;
     try {
-      DocumentRef doc = new DocumentRef(customer.getId().toString(), parts.docId(), parts.language());
-      title = storage.readDocumentMeta(doc, parts.branchName())
+      DocumentRef doc = new DocumentRef(customer.getId(), parts.docId());
+      title = storage.readDocumentMeta(doc, parts.versionName())
           .map(DocumentMeta::title)
           .orElse(null);
     } catch (StorageException e) {
-      log.error("[reconcile] failed to read meta.json for {}/{}: {}", parts.docId(), parts.language(), e.getMessage());
+      log.error("[reconcile] failed to read meta.json for {}: {}", parts.docId(), e.getMessage());
     }
-    log.info("[reconcile] recovered document {} / {} (title={})", parts.docId(), parts.language(), title);
-    return index.upsertDocument(new Document(customer.getId(), parts.docId(), parts.language(), title));
+    log.info("[reconcile] recovered document {} (title={})", parts.docId(), title);
+    return index.upsertDocument(new Document(customer.getId(), parts.docId(), title));
   }
 
-  /** refs/heads/docs/<docId>/<language>/<branchName> */
-  private record RefParts(String docId, String language, String branchName) {
+  /** refs/heads/docs/<docId>/<versionName> */
+  private record RefParts(String docId, String versionName) {
     static RefParts parse(String ref) {
       String prefix = "refs/heads/docs/";
       if (!ref.startsWith(prefix)) return null;
-      String[] parts = ref.substring(prefix.length()).split("/", 3);
-      if (parts.length != 3) return null;
-      return new RefParts(parts[0], parts[1], parts[2]);
+      String[] parts = ref.substring(prefix.length()).split("/", 2);
+      if (parts.length != 2) return null;
+      return new RefParts(parts[0], parts[1]);
     }
   }
 }

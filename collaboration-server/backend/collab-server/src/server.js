@@ -5,7 +5,7 @@ import express from 'express'
 import cors from 'cors'
 import { schema } from './schema.js'
 import { createMarkdownSerializer } from './markdown.js'
-import { loadSnapshot, saveSnapshot } from './persistenceClient.js'
+import { loadSnapshot, saveSnapshot, loadTenantSnapshot, saveTenantSnapshot } from './persistenceClient.js'
 import { loadLocal, appendDelta, compact, COMPACT_LOG_BYTES, listLocalDocuments } from './localStore.js'
 import { mergeBranches } from './mergeBranches.js'
 import { uploadAsset } from './artifactKeeperClient.js'
@@ -40,10 +40,34 @@ const liveDocuments = new Map()
 // collaboratively co-edit two diverged branches as if they were the same
 // live document. Old-style plain docIds (no "@") default to "master", so
 // nothing that connected before this existed breaks.
+//
+// Multi-tenant rooms are distinguished by an "mt:" prefix ("mt:acme-corp~
+// onboarding-guide@review-q3") rather than overloading the single-tenant
+// shape, so the long-working single-tenant path below is untouched by this.
+// "~" (not "/") separates customerId/docId deliberately -- documentName is
+// used directly as a fast-tier filename in localStore.js's path.join calls,
+// so a literal "/" here would silently turn into an unintended nested
+// directory that doesn't exist (found via real testing: onStoreDocument
+// failed with ENOENT until this was changed). customerId/docId are git-
+// URL-friendly slugs and never contain "~" in practice.
+// Language isn't part of the room name -- fixed to LANGUAGE for now (no
+// multi-language editing UI yet, see STATE.md); revisit if/when that's built.
+const LANGUAGE = 'en'
+
 function parseDocumentName(documentName) {
+  if (documentName.startsWith('mt:')) {
+    const rest = documentName.slice('mt:'.length) // customerId~docId@versionName
+    const at = rest.indexOf('@')
+    const path = at === -1 ? rest : rest.slice(0, at)
+    const versionName = at === -1 ? 'master' : rest.slice(at + 1)
+    const sep = path.indexOf('~')
+    const customerId = sep === -1 ? path : path.slice(0, sep)
+    const docId = sep === -1 ? '' : path.slice(sep + 1)
+    return { tenant: true, customerId, docId, branch: versionName, language: LANGUAGE }
+  }
   const at = documentName.indexOf('@')
-  if (at === -1) return { docId: documentName, branch: 'master' }
-  return { docId: documentName.slice(0, at), branch: documentName.slice(at + 1) }
+  if (at === -1) return { tenant: false, docId: documentName, branch: 'master' }
+  return { tenant: false, docId: documentName.slice(0, at), branch: documentName.slice(at + 1) }
 }
 
 const httpApp = express()
@@ -113,7 +137,11 @@ async function checkpointToGit(documentName, entry) {
   // safe, because the individual chunks are now durable elsewhere.
   const changelog = entry.changelog.map((e) => JSON.stringify(e)).join('\n')
 
-  await saveSnapshot(entry.docId, entry.branch, ydocBytes, markdown, changelog, contributors)
+  if (entry.tenant) {
+    await saveTenantSnapshot(entry.customerId, entry.docId, entry.branch, entry.language, ydocBytes, markdown, changelog, contributors)
+  } else {
+    await saveSnapshot(entry.docId, entry.branch, ydocBytes, markdown, changelog, contributors)
+  }
   entry.dirty = false
   entry.contributors.clear()
   entry.changelog = []
@@ -152,11 +180,9 @@ const hocuspocus = Server.configure({
   },
 
   onLoadDocument: async ({ documentName, document }) => {
-    const { docId, branch } = parseDocumentName(documentName)
     const entry = {
       document,
-      docId,
-      branch,
+      ...parseDocumentName(documentName),
       dirty: false,
       contributors: new Set(['restored']),
       lastSavedStateVector: null,
@@ -186,7 +212,9 @@ const hocuspocus = Server.configure({
     }
 
     try {
-      const gitBytes = await loadSnapshot(docId, branch)
+      const gitBytes = entry.tenant
+        ? await loadTenantSnapshot(entry.customerId, entry.docId, entry.branch, entry.language)
+        : await loadSnapshot(entry.docId, entry.branch)
       if (!gitBytes) return
       const doc = new Y.Doc()
       Y.applyUpdate(doc, gitBytes)
@@ -295,13 +323,11 @@ async function reconcileFastTierOnStartup() {
     try {
       const chunks = await loadLocal(documentName)
       if (!chunks || chunks.length === 0) continue
-      const { docId, branch } = parseDocumentName(documentName)
       const doc = new Y.Doc()
       for (const chunk of chunks) Y.applyUpdate(doc, chunk)
       liveDocuments.set(documentName, {
         document: doc,
-        docId,
-        branch,
+        ...parseDocumentName(documentName),
         dirty: true,
         contributors: new Set(['restored']),
         lastSavedStateVector: Y.encodeStateVector(doc),
