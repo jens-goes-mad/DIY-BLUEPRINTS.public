@@ -28,16 +28,16 @@ function docFromBytes(bytes) {
  * attribute, or an edit landing on content the other branch deleted) --
  * see conflicts.js for exactly what is and isn't detected.
  */
-export async function mergeBranches(docId, sourceBranch, targetBranch, author) {
-  const mergeBaseCommit = await findMergeBase(sourceBranch, targetBranch)
+export async function mergeBranches(customerId, docId, sourceVersionName, targetVersionName, language, author) {
+  const mergeBaseCommit = await findMergeBase(customerId, docId, sourceVersionName, targetVersionName)
   if (!mergeBaseCommit) {
-    throw new Error(`branches share no common history: ${sourceBranch}, ${targetBranch}`)
+    throw new Error(`versions share no common history: ${sourceVersionName}, ${targetVersionName}`)
   }
 
   const [baseBytes, targetBytes, sourceBytes] = await Promise.all([
-    loadSnapshot(docId, mergeBaseCommit),
-    loadSnapshot(docId, targetBranch),
-    loadSnapshot(docId, sourceBranch),
+    loadSnapshot(customerId, docId, mergeBaseCommit, language),
+    loadSnapshot(customerId, docId, targetVersionName, language),
+    loadSnapshot(customerId, docId, sourceVersionName, language),
   ])
 
   const baseDoc = docFromBytes(baseBytes)
@@ -55,6 +55,6 @@ export async function mergeBranches(docId, sourceBranch, targetBranch, author) {
   const node = schema.nodeFromJSON(docJSON)
   const markdown = markdownSerializer.serialize(node)
 
-  const commitResult = await commitMerge(docId, targetBranch, sourceBranch, mergedBytes, markdown, author)
+  const commitResult = await commitMerge(customerId, docId, sourceVersionName, targetVersionName, language, mergedBytes, markdown, author)
   return { merged: true, ...commitResult }
 }

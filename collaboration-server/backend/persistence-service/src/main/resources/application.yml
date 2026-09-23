@@ -1,13 +1,10 @@
 server:
   port: 8080
 
-repo:
-  path: /data/repo
-
-# Multi-tenant repo root for the new DocumentStorageService/
-# GitDocumentStorageService (RFC: multi-tenant scale, STATE.md) -- separate
-# from the single-repo "repo.path" above, which still backs the live
-# GitRepositoryService/DocumentController untouched.
+# Multi-tenant repo root for DocumentStorageService/GitDocumentStorageService
+# (RFC: multi-tenant scale, STATE.md) -- the only repo root now; the
+# earlier single-repo "repo.path" setting was retired 2026-09-24 alongside
+# GitRepositoryService.
 repos:
   root: /data/repos
 

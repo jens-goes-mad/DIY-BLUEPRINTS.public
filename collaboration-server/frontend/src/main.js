@@ -9,44 +9,24 @@ import { HocuspocusProvider } from '@hocuspocus/provider'
 const HTTP_URL = import.meta.env.VITE_COLLAB_HTTP_URL || 'http://localhost:3000'
 const WS_URL = import.meta.env.VITE_COLLAB_WS_URL || 'ws://localhost:1234'
 const PERSISTENCE_URL = import.meta.env.VITE_PERSISTENCE_URL || 'http://localhost:8081'
-const DOC_ID = 'default'
 
 const CURSOR_COLORS = ['#f44336', '#2196f3', '#4caf50', '#ff9800', '#9c27b0', '#009688']
 
-// One flattened dropdown covering both the legacy single-tenant branches
-// ("legacy:<branch>") and every multi-tenant customer/document/version
-// combo ("mt:<customerId>/<docId>@<versionName>") -- a cascading
-// customer->document->version picker (like admin-mt.js's) would be more
-// complete, but for testing this app against the new multi-tenant model
-// a single flat list is enough, and keeps the legacy path exercisable too.
+// The dropdown key IS the Hocuspocus room name directly --
+// "customerId~docId@versionName" (see collab-server's parseDocumentName).
+// In the real flow, JWT/Keycloak resolves customerId and the client's own
+// session already knows document/version; a cascading customer->document
+//->version picker (like admin-mt.js's) would be more complete than this
+// flattened list, but this is enough for testing against the live model.
+// "~" (not "/") between customerId/docId deliberately -- documentName
+// doubles as a fast-tier filename in collab-server's localStore.js, where
+// a literal "/" would turn into an unintended nested directory.
 function currentDocKey() {
-  return new URLSearchParams(window.location.search).get('doc') || 'legacy:master'
+  return new URLSearchParams(window.location.search).get('doc')
 }
 
-// Translates a dropdown key into the actual Hocuspocus room name. The
-// legacy branch is folded back into the historical "default@branch" shape
-// so collab-server's existing single-tenant parseDocumentName path is
-// completely untouched; "mt:..." keys are passed straight through, since
-// that's exactly the room-name shape collab-server's new tenant branch
-// of parseDocumentName expects. Note the "~" (not "/") between
-// customerId and docId -- documentName doubles as a fast-tier filename in
-// collab-server's localStore.js, where a literal "/" would turn into an
-// unintended (and nonexistent) nested directory.
-function roomNameFor(docKey) {
-  if (docKey.startsWith('legacy:')) return `${DOC_ID}@${docKey.slice('legacy:'.length)}`
-  return docKey
-}
-
-async function fetchFlattenedDocEntries() {
+async function fetchDocEntries() {
   const entries = []
-
-  try {
-    const branches = await (await fetch(`${PERSISTENCE_URL}/api/branches`)).json()
-    for (const b of branches.sort()) entries.push({ key: `legacy:${b}`, label: `(legacy single-tenant) ${b}` })
-  } catch (err) {
-    console.error('failed to load legacy branch list:', err.message)
-  }
-
   try {
     const customers = await (await fetch(`${PERSISTENCE_URL}/api/mt/customers`)).json()
     for (const c of customers) {
@@ -62,23 +42,22 @@ async function fetchFlattenedDocEntries() {
         ).json()
         for (const v of versions) {
           entries.push({
-            key: `mt:${c.customerId}~${docId}@${v}`,
+            key: `${c.customerId}~${docId}@${v}`,
             label: `${c.displayName} / ${docId} / ${v}`,
           })
         }
       }
     }
   } catch (err) {
-    console.error('failed to load multi-tenant document list:', err.message)
+    console.error('failed to load document list:', err.message)
   }
-
   return entries
 }
 
 async function populateBranchDropdown(docKey) {
   const select = document.getElementById('branch-select')
-  const entries = await fetchFlattenedDocEntries()
-  if (!entries.some((e) => e.key === docKey)) entries.push({ key: docKey, label: docKey })
+  const entries = await fetchDocEntries()
+  if (docKey && !entries.some((e) => e.key === docKey)) entries.push({ key: docKey, label: docKey })
 
   select.innerHTML = ''
   for (const e of entries) {
@@ -89,16 +68,17 @@ async function populateBranchDropdown(docKey) {
     select.appendChild(option)
   }
 
-  // A branch/version is a different live-editing "room" (see
-  // collab-server's parseDocumentName) -- switching means reconnecting
-  // from scratch, which a full navigation gives us for free, no manual
-  // teardown of the editor/provider needed.
+  // A version is a different live-editing "room" (see collab-server's
+  // parseDocumentName) -- switching means reconnecting from scratch,
+  // which a full navigation gives us for free, no manual teardown of the
+  // editor/provider needed.
   select.addEventListener('change', () => {
     const url = new URL(window.location.href)
     url.searchParams.set('doc', select.value)
-    url.searchParams.delete('branch')
     window.location.href = url.toString()
   })
+
+  return entries
 }
 
 // Uploads to collab-server, which proxies to Artifact Keeper server-side
@@ -120,9 +100,24 @@ async function uploadImage(file) {
 }
 
 async function main() {
-  const docKey = currentDocKey()
-  await populateBranchDropdown(docKey)
-  const roomName = roomNameFor(docKey)
+  let docKey = currentDocKey()
+  const entries = await populateBranchDropdown(docKey)
+
+  if (!docKey) {
+    if (entries.length === 0) {
+      document.getElementById('user-badge').textContent =
+        'No documents yet -- create a customer and document via /admin-mt.html'
+      return
+    }
+    // No ?doc= given: default to the first available document, and
+    // reflect that choice in the URL/dropdown without a full reload.
+    docKey = entries[0].key
+    const url = new URL(window.location.href)
+    url.searchParams.set('doc', docKey)
+    window.history.replaceState({}, '', url)
+    document.getElementById('branch-select').value = docKey
+  }
+  const roomName = docKey
 
   const res = await fetch(`${HTTP_URL}/api/whoami`)
   const { userId } = await res.json()

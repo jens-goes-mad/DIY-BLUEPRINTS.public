@@ -110,7 +110,7 @@ node integration/merge-with-conflict-detection.mjs
 ## `jgit-merge-mechanics/` — standalone Java/JGit proof, no app code involved
 
 A throwaway Maven project (not part of `persistence-service`) proving the
-exact JGit mechanism `GitRepositoryService.merge()` relies on: that
+exact JGit mechanism `GitDocumentStorageService.merge()` relies on: that
 `MergeCommand` with `MergeStrategy.OURS` produces a real two-parent commit,
 and that amending that commit afterward to swap in different tree content
 preserves both parents untouched. This is what justified building the

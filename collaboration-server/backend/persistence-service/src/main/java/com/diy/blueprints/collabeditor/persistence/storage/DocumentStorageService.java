@@ -1,5 +1,6 @@
 package com.diy.blueprints.collabeditor.persistence.storage;
 
+import com.diy.blueprints.collabeditor.persistence.BlameLine;
 import com.diy.blueprints.collabeditor.persistence.MergeOutcome;
 
 import java.util.List;
@@ -45,19 +46,51 @@ import java.util.Optional;
  * -- this interface is about content and history, that one is about fast
  * lookups. Collapsing them into one interface would blur exactly the line
  * this RFC draws between the two.
+ *
+ * listDocuments/listVersions/loadChangelog/history/findMergeBase are all
+ * on this interface too (revised -- see STATE.md), even though today's
+ * only implementation happens to answer them by walking git refs/blame:
+ * "what documents does this customer have," "what versions does this
+ * document have," "who last touched this line," and "where did these two
+ * versions diverge" are questions any version-aware storage backend has
+ * to be able to answer, not git-specific concerns -- unlike, say, a raw
+ * ref name or a JGit type, which really would leak the implementation.
+ * The dividing line is "could a different backend answer this in its own
+ * way," not "does the current implementation happen to use git for it."
  */
 public interface DocumentStorageService {
 
   /** Provisions storage for a brand-new customer and durably records its identity. Idempotent: a no-op if already provisioned. */
   void initCustomer(String customerId, CustomerMeta meta);
 
+  /** Every document belonging to this customer. */
+  List<String> listDocuments(String customerId);
+
   /** Provisions a brand-new document (seeding its master version, no language content yet) and durably records its identity. Returns the initial version's identifier. */
   String createDocument(DocumentRef doc, DocumentMeta meta);
+
+  /** Every version (branch) this document has. */
+  List<String> listVersions(DocumentRef doc);
 
   /** Every language present in this version's tree. */
   List<String> listLanguages(DocumentRef doc, String versionName);
 
+  /**
+   * versionName is usually a real named version, but may also be an
+   * opaque revision identifier this interface previously handed back (see
+   * save()/createVersion()/findMergeBase()) -- e.g. loading content as of
+   * the merge-base commit before a 3-way merge, which has no version name
+   * of its own.
+   */
   Optional<byte[]> load(DocumentRef doc, String versionName, String language);
+
+  /**
+   * The changelog committed alongside the most recent save for this
+   * language -- individual per-save chunks since the previous commit on
+   * this version, not the whole history (see save()'s own changelogJson
+   * parameter). Empty string if nothing has been saved yet.
+   */
+  String loadChangelog(DocumentRef doc, String versionName, String language);
 
   /**
    * Writes contentBytes/markdown/changelogJson for one language within
@@ -77,4 +110,15 @@ public interface DocumentStorageService {
 
   MergeOutcome merge(DocumentRef doc, String sourceVersionName, String targetVersionName, String language,
                       byte[] mergedContentBytes, String mergedMarkdown, String author);
+
+  /** Per-line attribution for this language's content, oldest surviving edit per line. Empty list if nothing has been saved yet. */
+  List<BlameLine> history(DocumentRef doc, String versionName, String language);
+
+  /**
+   * The commit/revision both versions diverged from -- needed before a
+   * merge, to detect conflicts by decoding what each version actually
+   * changed relative to this shared ancestor. Null if the versions share
+   * no history at all.
+   */
+  String findMergeBase(DocumentRef doc, String versionA, String versionB);
 }

@@ -10,15 +10,12 @@ enable-log-linecount=1
 snapshots=tar.gz zip
 remove-suffix=1
 
-repo.url=default
-repo.path=/data/repo/.git
-repo.desc=Collaborative document snapshots (Markdown + git blame audit trail)
-
-# Multi-tenant customer repos (RFC: multi-tenant scale, STATE.md) -- each
+# Customer repos (RFC: multi-tenant scale, STATE.md) -- each
 # customerId.git directory under /data/repos is a non-bare repo (a nested
-# .git subdirectory, same layout as /data/repo above), so cgit's own
-# scan-tree logic finds the nested .git and registers the parent directory
-# as the repo automatically. Auto-discovered on every request rather than
-# listed one repo.url per customer, so a new customer created via
-# admin-mt.html shows up here with no cgit config change or redeploy.
+# .git subdirectory), so cgit's own scan-tree logic finds the nested .git
+# and registers the parent directory as the repo automatically.
+# Auto-discovered on every request rather than listed one repo.url per
+# customer, so a new customer created via admin-mt.html shows up here with
+# no cgit config change or redeploy. The single-tenant "default" repo
+# (/data/repo) this used to sit alongside was retired 2026-09-24.
 scan-path=/data/repos

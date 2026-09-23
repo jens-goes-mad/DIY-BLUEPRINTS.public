@@ -2,40 +2,65 @@ import * as Y from 'yjs'
 
 const PERSISTENCE_URL = 'http://localhost:8081'
 const COLLAB_URL = 'http://localhost:3000'
+const LANGUAGE = 'en'
 const RUN_ID = Date.now().toString(36)
+const CUSTOMER_ID = `mergeconflict-${RUN_ID}`
 
 function b64(bytes) {
   return Buffer.from(bytes).toString('base64')
 }
 
-async function save(docId, branch, ydoc, markdown, author) {
-  const res = await fetch(`${PERSISTENCE_URL}/api/documents/${docId}?branch=${branch}`, {
+async function createCustomer() {
+  const res = await fetch(`${PERSISTENCE_URL}/api/mt/customers`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ydoc: b64(Y.encodeStateAsUpdate(ydoc)), markdown, changelog: '', author }),
+    body: JSON.stringify({ customerId: CUSTOMER_ID, displayName: 'Merge Conflict Test Co' }),
   })
+  if (!res.ok) throw new Error(`createCustomer failed: ${res.status}`)
+}
+
+async function createDocument(docId) {
+  const res = await fetch(`${PERSISTENCE_URL}/api/mt/customers/${CUSTOMER_ID}/documents`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ docId, title: docId }),
+  })
+  if (!res.ok) throw new Error(`createDocument failed: ${res.status}`)
+}
+
+async function save(docId, versionName, ydoc, markdown, author) {
+  const res = await fetch(
+    `${PERSISTENCE_URL}/api/mt/customers/${CUSTOMER_ID}/documents/${docId}/versions/${versionName}/languages/${LANGUAGE}/content`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ydoc: b64(Y.encodeStateAsUpdate(ydoc)), markdown, changelog: '', author }),
+    },
+  )
   if (!res.ok) throw new Error(`save failed: ${res.status}`)
 }
 
-async function createBranch(newBranch, fromBranch) {
-  const res = await fetch(`${PERSISTENCE_URL}/api/branches`, {
+async function createVersion(docId, versionName, fromVersionName) {
+  const res = await fetch(`${PERSISTENCE_URL}/api/mt/customers/${CUSTOMER_ID}/documents/${docId}/versions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ newBranch, fromBranch }),
+    body: JSON.stringify({ versionName, fromVersionName }),
   })
-  if (!res.ok) throw new Error(`createBranch failed: ${res.status}`)
+  if (!res.ok) throw new Error(`createVersion failed: ${res.status}`)
 }
 
-async function branchTip(docId, branch) {
-  const res = await fetch(`${PERSISTENCE_URL}/api/documents/${docId}?branch=${branch}`)
+async function branchTip(docId, versionName) {
+  const res = await fetch(
+    `${PERSISTENCE_URL}/api/mt/customers/${CUSTOMER_ID}/documents/${docId}/versions/${versionName}/languages/${LANGUAGE}/content`,
+  )
   return res.json()
 }
 
-async function mergeViaCollabServer(docId, sourceBranch, targetBranch, author) {
-  const res = await fetch(`${COLLAB_URL}/api/documents/${docId}/merge`, {
+async function mergeViaCollabServer(docId, sourceVersionName, targetVersionName, author) {
+  const res = await fetch(`${COLLAB_URL}/api/customers/${CUSTOMER_ID}/documents/${docId}/merge`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sourceBranch, targetBranch, author }),
+    body: JSON.stringify({ sourceVersionName, targetVersionName, language: LANGUAGE, author }),
   })
   return { status: res.status, body: await res.json() }
 }
@@ -55,11 +80,12 @@ function makeDoc(text, attrs = {}) {
 async function testCleanMerge() {
   console.log('=== CLEAN MERGE (no conflicts -- should commit) ===')
   const docId = `merge-clean-${RUN_ID}`
-  const branch = `feature-clean-${RUN_ID}`
+  const versionName = `feature-clean-${RUN_ID}`
+  await createDocument(docId)
 
   const base = makeDoc('Base sentence.')
   await save(docId, 'master', base, 'Base sentence.', 'User-1')
-  await createBranch(branch, 'master')
+  await createVersion(docId, versionName, 'master')
 
   const onMaster = new Y.Doc()
   Y.applyUpdate(onMaster, Y.encodeStateAsUpdate(base))
@@ -75,26 +101,29 @@ async function testCleanMerge() {
     el.insert(0, [t])
     return el
   })()])
-  await save(docId, branch, onFeature, 'Base sentence.\n\nA whole new second paragraph.', 'User-Feature')
+  await save(docId, versionName, onFeature, 'Base sentence.\n\nA whole new second paragraph.', 'User-Feature')
 
-  const result = await mergeViaCollabServer(docId, branch, 'master', 'merge-bot')
+  const result = await mergeViaCollabServer(docId, versionName, 'master', 'merge-bot')
   console.log('HTTP', result.status, JSON.stringify(result.body))
   console.log('merged === true:', result.body.merged === true)
   console.log('has commitId:', !!result.body.commitId)
   console.log('parentCount === 2:', result.body.parentCount === 2)
 
   const finalMaster = await branchTip(docId, 'master')
-  console.log('final master markdown:', JSON.stringify(finalMaster.markdown))
+  const finalDoc = new Y.Doc()
+  Y.applyUpdate(finalDoc, Buffer.from(finalMaster.ydoc, 'base64'))
+  console.log('final master text (decoded):', JSON.stringify(finalDoc.getXmlFragment('default').get(0).get(0).toString()))
 }
 
 async function testConflictingMerge() {
   console.log('\n=== CONFLICTING MERGE (both sides change the same attribute -- should NOT commit) ===')
   const docId = `merge-conflict-${RUN_ID}`
-  const branch = `feature-conflict-${RUN_ID}`
+  const versionName = `feature-conflict-${RUN_ID}`
+  await createDocument(docId)
 
   const base = makeDoc('Heading text.', { level: 1 })
   await save(docId, 'master', base, 'Heading text.', 'User-1')
-  await createBranch(branch, 'master')
+  await createVersion(docId, versionName, 'master')
 
   const onMaster = new Y.Doc()
   Y.applyUpdate(onMaster, Y.encodeStateAsUpdate(base))
@@ -104,11 +133,11 @@ async function testConflictingMerge() {
   const onFeature = new Y.Doc()
   Y.applyUpdate(onFeature, Y.encodeStateAsUpdate(base))
   onFeature.getXmlFragment('default').get(0).setAttribute('level', 3)
-  await save(docId, branch, onFeature, 'Heading text.', 'User-Feature')
+  await save(docId, versionName, onFeature, 'Heading text.', 'User-Feature')
 
   const beforeMerge = await branchTip(docId, 'master')
 
-  const result = await mergeViaCollabServer(docId, branch, 'master', 'merge-bot')
+  const result = await mergeViaCollabServer(docId, versionName, 'master', 'merge-bot')
   console.log('HTTP', result.status, JSON.stringify(result.body, null, 2))
   console.log('merged === false:', result.body.merged === false)
   console.log('conflicts.length >= 1:', (result.body.conflicts || []).length >= 1)
@@ -127,11 +156,16 @@ async function testConflictingMerge() {
 // deleted real production content on "default" the first time a merge ran
 // on a branch that had unrelated save()s interleaved on it. The fix moved
 // merge() to the same pure object-database plumbing save() already used.
+// In the multi-tenant model this maps directly onto: merging one docId's
+// version must not touch a different docId's content in the same
+// customer's repo.
 async function testMergePreservesUnrelatedDocs() {
-  console.log('\n=== REGRESSION: merging one docId must not touch an UNRELATED docId on the same branch ===')
+  console.log('\n=== REGRESSION: merging one docId must not touch an UNRELATED docId in the same customer repo ===')
   const bystanderDocId = `bystander-${RUN_ID}`
   const mergeDocId = `merge-bystander-check-${RUN_ID}`
-  const branch = `feature-bystander-${RUN_ID}`
+  const versionName = `feature-bystander-${RUN_ID}`
+  await createDocument(bystanderDocId)
+  await createDocument(mergeDocId)
 
   const bystander = makeDoc('This unrelated document must survive the merge untouched.')
   await save(bystanderDocId, 'master', bystander, 'This unrelated document must survive the merge untouched.', 'User-1')
@@ -139,25 +173,25 @@ async function testMergePreservesUnrelatedDocs() {
 
   const base = makeDoc('Merge target base.')
   await save(mergeDocId, 'master', base, 'Merge target base.', 'User-1')
-  await createBranch(branch, 'master')
+  await createVersion(mergeDocId, versionName, 'master')
 
   const onFeature = new Y.Doc()
   Y.applyUpdate(onFeature, Y.encodeStateAsUpdate(base))
   onFeature.getXmlFragment('default').get(0).get(0).insert(18, ' Extended on feature.')
-  await save(mergeDocId, branch, onFeature, 'Merge target base. Extended on feature.', 'User-Feature')
+  await save(mergeDocId, versionName, onFeature, 'Merge target base. Extended on feature.', 'User-Feature')
 
-  const result = await mergeViaCollabServer(mergeDocId, branch, 'master', 'merge-bot')
+  const result = await mergeViaCollabServer(mergeDocId, versionName, 'master', 'merge-bot')
   console.log('merge result:', JSON.stringify(result.body))
   console.log('merge succeeded:', result.body.merged === true)
 
   const bystanderAfter = await branchTip(bystanderDocId, 'master')
   console.log('bystander ydoc unchanged:', bystanderBefore.ydoc === bystanderAfter.ydoc)
-  console.log('bystander markdown unchanged:', bystanderBefore.markdown === bystanderAfter.markdown)
   if (bystanderBefore.ydoc !== bystanderAfter.ydoc) {
     throw new Error('REGRESSION: merge dropped an unrelated docId\'s content -- this is the exact incident from STATE.md')
   }
 }
 
+await createCustomer()
 await testCleanMerge()
 await testConflictingMerge()
 await testMergePreservesUnrelatedDocs()

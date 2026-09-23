@@ -1,8 +1,16 @@
-package com.diy.blueprints.collabeditor.persistence.storage;
+package com.diy.blueprints.collabeditor.persistence.storage.git;
 
+import com.diy.blueprints.collabeditor.persistence.BlameLine;
 import com.diy.blueprints.collabeditor.persistence.MergeOutcome;
+import com.diy.blueprints.collabeditor.persistence.storage.CustomerMeta;
+import com.diy.blueprints.collabeditor.persistence.storage.DocumentMeta;
+import com.diy.blueprints.collabeditor.persistence.storage.DocumentRef;
+import com.diy.blueprints.collabeditor.persistence.storage.DocumentStorageService;
+import com.diy.blueprints.collabeditor.persistence.storage.StorageException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.blame.BlameResult;
+import org.eclipse.jgit.diff.RawText;
 import org.eclipse.jgit.dircache.DirCache;
 import org.eclipse.jgit.dircache.DirCacheBuilder;
 import org.eclipse.jgit.dircache.DirCacheEntry;
@@ -21,9 +29,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * The one real implementation of DocumentStorageService: one bare-in-spirit
@@ -33,12 +44,17 @@ import java.util.Optional;
  * listing on disk is human-legible; no sharding, since sharding by a
  * readable name's leading characters would cluster badly (company names
  * aren't uniformly distributed the way random IDs are), and a flat
- * directory of a few hundred repos is fine on any modern filesystem. Same
- * pure object-database-plumbing approach as the existing single-repo
- * GitRepositoryService (never touches a working tree -- see that class's
- * javadoc for the 2026-09-19 incident this pattern avoids), generalized to
- * (DocumentRef, versionName, language) instead of a single fixed repo and
- * (docId, branch).
+ * directory of a few hundred repos is fine on any modern filesystem. Never
+ * touches a working tree/index -- pure object-database plumbing throughout
+ * (see buildTreeWithOverride/commit/updateBranchRef below), which is what
+ * lets concurrent saves across different customers/documents/versions
+ * never race over a checkout. This class used to coexist with a separate
+ * single-repo GitRepositoryService (retired 2026-09-24 once DocumentController
+ * became customerId-aware and every caller could route through here
+ * instead -- see STATE.md); the working-tree-avoidance discipline traces
+ * back to a real incident on that single-repo predecessor: an earlier
+ * merge() implementation used JGit's checkout-based MergeCommand and
+ * silently dropped unrelated files from the resulting commit's tree.
  *
  * A version (branch) is a unit of change that may touch several languages
  * over its lifetime, not a per-language branch namespace -- see
@@ -62,12 +78,17 @@ import java.util.Optional;
  * write) into one, since a caller never legitimately wants one without
  * the other, and exposing them separately only invited leaking *how* git
  * durably records identity (a file every branch inherits via ordinary
- * ancestry) as if that were itself a generic operation. readDocumentMeta(),
- * listCustomerIds(), listAllRefs(), and findMergeBase(), below, are
- * deliberately NOT part of DocumentStorageService at all -- they're
- * inherently git-specific and their only consumer, GitReconciliationService
- * or MultiTenantAdminController, already depends on this concrete class
- * rather than the generic interface.
+ * ancestry) as if that were itself a generic operation. readCustomerMeta(),
+ * readDocumentMeta(), listCustomerIds(), listAllRefs(), and
+ * deleteCustomer(), below, are deliberately NOT part of DocumentStorageService
+ * -- reading raw customer/document metadata and enumerating/deleting whole
+ * customers really are git-specific (or at least implementation-specific)
+ * admin operations, unlike listDocuments/listVersions/history/
+ * findMergeBase, which moved onto the interface itself (see its own
+ * javadoc) since those questions aren't git-specific, just currently
+ * git-answered. Their only consumers -- GitReconciliationService and the
+ * customer-lifecycle endpoints on MultiTenantAdminController -- already
+ * depend on this concrete class rather than the generic interface.
  *
  * Every public method here funnels its body through unchecked() below,
  * which turns whatever checked exception JGit/Jackson/java.io actually
@@ -77,11 +98,11 @@ import java.util.Optional;
  * "version already exists") passes through unwrapped; only genuine
  * checked failures get wrapped.
  *
- * Deliberately a completely separate bean from GitRepositoryService: this
- * class does not replace it, and DocumentController still talks to
- * GitRepositoryService/the single "repo.path" repo entirely unchanged.
- * This is new, additive code -- see STATE.md's RFC section for why it's
- * not yet wired into the live editor's request path.
+ * The one storage implementation in the whole app: DocumentController (the
+ * live editor's request path), MultiTenantAdminController (customer
+ * lifecycle), and GitReconciliationService all depend on this class (the
+ * first two through the generic DocumentStorageService interface where
+ * possible, the latter two directly for the git-specific extras below).
  */
 @Service
 public class GitDocumentStorageService implements DocumentStorageService {
@@ -171,6 +192,27 @@ public class GitDocumentStorageService implements DocumentStorageService {
     });
   }
 
+  /** refs/heads/docs/<docId>/<versionName> -- same parsing shape RefReconciliationService uses internally. */
+  private record RefParts(String docId, String versionName) {
+    static RefParts parse(String ref) {
+      String prefix = "refs/heads/docs/";
+      if (!ref.startsWith(prefix)) return null;
+      String[] parts = ref.substring(prefix.length()).split("/", 2);
+      if (parts.length != 2) return null;
+      return new RefParts(parts[0], parts[1]);
+    }
+  }
+
+  @Override
+  public List<String> listDocuments(String customerId) {
+    Set<String> docIds = new LinkedHashSet<>();
+    for (String ref : listAllRefs(customerId).keySet()) {
+      RefParts parts = RefParts.parse(ref);
+      if (parts != null) docIds.add(parts.docId());
+    }
+    return docIds.stream().sorted().collect(Collectors.toList());
+  }
+
   @Override
   public synchronized String createDocument(DocumentRef doc, DocumentMeta meta) {
     return unchecked("failed to create document " + doc.docId(), () -> {
@@ -189,6 +231,16 @@ public class GitDocumentStorageService implements DocumentStorageService {
         }
       }
     });
+  }
+
+  @Override
+  public List<String> listVersions(DocumentRef doc) {
+    String prefix = "refs/heads/docs/" + doc.docId() + "/";
+    return listAllRefs(doc.customerId()).keySet().stream()
+        .filter(ref -> ref.startsWith(prefix))
+        .map(ref -> ref.substring(prefix.length()))
+        .sorted()
+        .collect(Collectors.toList());
   }
 
   /**
@@ -253,8 +305,21 @@ public class GitDocumentStorageService implements DocumentStorageService {
   public Optional<byte[]> load(DocumentRef doc, String versionName, String language) {
     return unchecked("failed to load " + doc.docId() + "/" + language, () -> {
       try (Repository repo = openRepo(doc.customerId())) {
-        byte[] bytes = readBlob(repo, refName(doc, versionName), languageDir(doc, language) + "/content.ydoc");
-        return Optional.ofNullable(bytes);
+        // versionName is usually a real named version, but may also be an
+        // opaque revision identifier this class previously handed back
+        // (see save()/createVersion()/findMergeBase()'s own javadoc) --
+        // e.g. collab-server loading content as of the merge-base commit
+        // before a 3-way merge, which has no version name of its own.
+        ObjectId commitId = repo.resolve(refName(doc, versionName));
+        if (commitId == null) {
+          commitId = repo.resolve(versionName);
+        }
+        if (commitId == null) return Optional.empty();
+        ObjectId blobId = repo.resolve(commitId.getName() + ":" + languageDir(doc, language) + "/content.ydoc");
+        if (blobId == null) return Optional.empty();
+        try (ObjectReader reader = repo.newObjectReader()) {
+          return Optional.of(reader.open(blobId).getBytes());
+        }
       }
     });
   }
@@ -267,6 +332,17 @@ public class GitDocumentStorageService implements DocumentStorageService {
     try (ObjectReader reader = repo.newObjectReader()) {
       return reader.open(blobId).getBytes();
     }
+  }
+
+  @Override
+  public String loadChangelog(DocumentRef doc, String versionName, String language) {
+    return unchecked("failed to load changelog for " + doc.docId() + "/" + language, () -> {
+      byte[] bytes;
+      try (Repository repo = openRepo(doc.customerId())) {
+        bytes = readBlob(repo, refName(doc, versionName), languageDir(doc, language) + "/changelog.jsonl");
+      }
+      return bytes == null ? "" : new String(bytes, StandardCharsets.UTF_8);
+    });
   }
 
   @Override
@@ -301,10 +377,9 @@ public class GitDocumentStorageService implements DocumentStorageService {
 
   /**
    * Carries forward every path already in branchHead's tree except the
-   * ones being overridden, same approach as the single-repo
-   * GitRepositoryService.buildTree -- see that class's javadoc for why
-   * this (never touching a working tree/index) is deliberate, not an
-   * arbitrary style choice.
+   * ones being overridden -- never touches a working tree/index (see this
+   * class's own javadoc for why that's deliberate, not an arbitrary style
+   * choice).
    */
   private ObjectId buildTreeWithOverride(Repository repo, ObjectInserter inserter, ObjectId branchHead,
                                           Map<String, ObjectId> overrides) throws IOException {
@@ -387,9 +462,9 @@ public class GitDocumentStorageService implements DocumentStorageService {
   public synchronized void deleteVersion(DocumentRef doc, String versionName) {
     unchecked("failed to delete version " + versionName + " for " + doc.docId(), () -> {
       // "master" holds a document's shipped, all-languages-complete state
-      // and every other version's history traces back to it -- same
-      // protection as GitRepositoryService.deleteBranch on the
-      // single-repo model.
+      // and every other version's history traces back to it, so deleting
+      // it would orphan the whole document, not just remove one line of
+      // history.
       if ("master".equals(versionName)) {
         throw new IllegalArgumentException("cannot delete the default version: " + versionName);
       }
@@ -448,9 +523,41 @@ public class GitDocumentStorageService implements DocumentStorageService {
     });
   }
 
+  @Override
+  public List<BlameLine> history(DocumentRef doc, String versionName, String language) {
+    return unchecked("failed to compute history for " + doc.docId() + "/" + language, () -> {
+      List<BlameLine> lines = new ArrayList<>();
+      try (Repository repo = openRepo(doc.customerId())) {
+        ObjectId branchHead = repo.resolve(refName(doc, versionName));
+        if (branchHead == null) return lines;
+
+        BlameResult result = new Git(repo).blame()
+            .setFilePath(languageDir(doc, language) + "/content.md")
+            .setStartCommit(branchHead)
+            .call();
+        if (result == null) return lines;
+
+        RawText content = result.getResultContents();
+        for (int i = 0; i < content.size(); i++) {
+          PersonIdent sourceAuthor = result.getSourceAuthor(i);
+          RevCommit sourceCommit = result.getSourceCommit(i);
+
+          lines.add(new BlameLine(
+              i + 1,
+              content.getString(i),
+              sourceAuthor != null ? sourceAuthor.getName() : "unknown",
+              sourceCommit != null ? sourceCommit.getName() : null,
+              sourceCommit != null ? sourceCommit.getAuthorIdent().getWhen().toInstant().toString() : null
+          ));
+        }
+      }
+      return lines;
+    });
+  }
+
   /**
    * NOT part of the DocumentStorageService interface -- same category as
-   * listAllRefs/findMergeBase. Scans reposRoot directly for every
+   * listAllRefs. Scans reposRoot directly for every
    * customer's .git directory -- there's no Postgres customer registry
    * yet (see STATE.md's RFC section), so this is the only way to
    * enumerate customers right now. Fine at admin-tool scale (a directory
@@ -519,13 +626,7 @@ public class GitDocumentStorageService implements DocumentStorageService {
     });
   }
 
-  /**
-   * findMergeBase isn't part of DocumentStorageService's interface (it's a
-   * pre-merge lookup collab-server needs, not a storage primitive every
-   * caller needs) but every current implementation of that lookup
-   * (GitRepositoryService.findMergeBase) is identical in shape -- kept
-   * here too for symmetry/reuse once this class is actually wired in.
-   */
+  @Override
   public String findMergeBase(DocumentRef doc, String versionA, String versionB) {
     return unchecked("failed to find merge base for " + doc.docId(), () -> {
       try (Repository repo = openRepo(doc.customerId()); RevWalk revWalk = new RevWalk(repo)) {

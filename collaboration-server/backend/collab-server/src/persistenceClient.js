@@ -1,17 +1,32 @@
 const PERSISTENCE_URL = process.env.PERSISTENCE_URL || 'http://persistence-service:8080'
-const DEFAULT_BRANCH = process.env.BRANCH || 'master'
 
-export async function loadSnapshot(docId, branch = DEFAULT_BRANCH) {
-  const res = await fetch(`${PERSISTENCE_URL}/api/documents/${docId}?branch=${branch}`)
+// Every call here is scoped to (customerId, docId, versionName, language) --
+// the single-tenant docId@branch path this used to sit alongside (and the
+// "Tenant"-suffixed names this had while both existed) was retired
+// 2026-09-24 once DocumentController became customerId-aware for real: in
+// production, JWT/Keycloak resolves customerId and the client's own
+// session already knows document/version/language, so there's no more
+// "default" case to fall back to -- every caller supplies real values.
+
+function contentUrl(customerId, docId, versionName, language) {
+  return (
+    `${PERSISTENCE_URL}/api/mt/customers/${encodeURIComponent(customerId)}/documents/` +
+    `${encodeURIComponent(docId)}/versions/${encodeURIComponent(versionName)}/languages/` +
+    `${encodeURIComponent(language)}/content`
+  )
+}
+
+export async function loadSnapshot(customerId, docId, versionName, language) {
+  const res = await fetch(contentUrl(customerId, docId, versionName, language))
   if (!res.ok) throw new Error(`persistence-service load failed: ${res.status}`)
   const body = await res.json()
   if (!body.ydoc) return null
   return Buffer.from(body.ydoc, 'base64')
 }
 
-export async function saveSnapshot(docId, branch, ydocBytes, markdown, changelog, author) {
-  const res = await fetch(`${PERSISTENCE_URL}/api/documents/${docId}?branch=${branch}`, {
-    method: 'POST',
+export async function saveSnapshot(customerId, docId, versionName, language, ydocBytes, markdown, changelog, author) {
+  const res = await fetch(contentUrl(customerId, docId, versionName, language), {
+    method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       ydoc: Buffer.from(ydocBytes).toString('base64'),
@@ -23,56 +38,26 @@ export async function saveSnapshot(docId, branch, ydocBytes, markdown, changelog
   if (!res.ok) throw new Error(`persistence-service save failed: ${res.status}`)
 }
 
-// Multi-tenant counterparts of loadSnapshot/saveSnapshot above, targeting
-// GitDocumentStorageService via MultiTenantAdminController's content
-// endpoints (customer/document/version/language) instead of the
-// single-tenant docId@branch repo. Kept as separate functions rather than
-// branching inside loadSnapshot/saveSnapshot so the long-working
-// single-tenant path stays untouched.
-export async function loadTenantSnapshot(customerId, docId, versionName, language) {
+export async function findMergeBase(customerId, docId, versionA, versionB) {
   const url =
     `${PERSISTENCE_URL}/api/mt/customers/${encodeURIComponent(customerId)}/documents/` +
-    `${encodeURIComponent(docId)}/versions/${encodeURIComponent(versionName)}/languages/` +
-    `${encodeURIComponent(language)}/content`
+    `${encodeURIComponent(docId)}/versions/merge-base?a=${encodeURIComponent(versionA)}&b=${encodeURIComponent(versionB)}`
   const res = await fetch(url)
-  if (!res.ok) throw new Error(`persistence-service tenant load failed: ${res.status}`)
-  const body = await res.json()
-  if (!body.ydoc) return null
-  return Buffer.from(body.ydoc, 'base64')
-}
-
-export async function saveTenantSnapshot(customerId, docId, versionName, language, ydocBytes, markdown, changelog, author) {
-  const url =
-    `${PERSISTENCE_URL}/api/mt/customers/${encodeURIComponent(customerId)}/documents/` +
-    `${encodeURIComponent(docId)}/versions/${encodeURIComponent(versionName)}/languages/` +
-    `${encodeURIComponent(language)}/content`
-  const res = await fetch(url, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      ydoc: Buffer.from(ydocBytes).toString('base64'),
-      markdown,
-      changelog,
-      author,
-    }),
-  })
-  if (!res.ok) throw new Error(`persistence-service tenant save failed: ${res.status}`)
-}
-
-export async function findMergeBase(branchA, branchB) {
-  const res = await fetch(`${PERSISTENCE_URL}/api/branches/merge-base?a=${branchA}&b=${branchB}`)
   if (!res.ok) throw new Error(`persistence-service merge-base lookup failed: ${res.status}`)
   const body = await res.json()
   return body.commitId
 }
 
-export async function commitMerge(docId, targetBranch, sourceBranch, ydocBytes, markdown, author) {
-  const res = await fetch(`${PERSISTENCE_URL}/api/documents/${docId}/merge`, {
+export async function commitMerge(customerId, docId, sourceVersionName, targetVersionName, language, ydocBytes, markdown, author) {
+  const url =
+    `${PERSISTENCE_URL}/api/mt/customers/${encodeURIComponent(customerId)}/documents/` +
+    `${encodeURIComponent(docId)}/versions/${encodeURIComponent(targetVersionName)}/merge`
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      targetBranch,
-      sourceBranch,
+      sourceVersionName,
+      language,
       ydoc: Buffer.from(ydocBytes).toString('base64'),
       markdown,
       author,

@@ -5,34 +5,69 @@ import WebSocket from 'ws'
 globalThis.WebSocket = WebSocket
 
 // Unique per run so re-running this test doesn't accumulate unbounded
-// history under one docId -- not strictly required for correctness (the
-// N-1/N comparison works regardless of prior history), just tidier.
-const DOC_ID = `changelog-test-${Date.now().toString(36)}`
+// history under one customer/doc -- not strictly required for correctness
+// (the N-1/N comparison works regardless of prior history), just tidier.
+const RUN_ID = Date.now().toString(36)
+const CUSTOMER_ID = `changelogtest-${RUN_ID}`
+const DOC_ID = 'doc1'
+const LANGUAGE = 'en'
 const PERSISTENCE_URL = 'http://localhost:8081'
 
-async function fetchDoc() {
-  const res = await fetch(`${PERSISTENCE_URL}/api/documents/${DOC_ID}?branch=master`)
+async function createCustomer() {
+  const res = await fetch(`${PERSISTENCE_URL}/api/mt/customers`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ customerId: CUSTOMER_ID, displayName: 'Changelog Test Co' }),
+  })
+  if (!res.ok) throw new Error(`createCustomer failed: ${res.status}`)
+}
+
+async function createDocument() {
+  const res = await fetch(`${PERSISTENCE_URL}/api/mt/customers/${CUSTOMER_ID}/documents`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ docId: DOC_ID, title: 'Changelog Test Doc' }),
+  })
+  if (!res.ok) throw new Error(`createDocument failed: ${res.status}`)
+}
+
+async function fetchContent() {
+  const res = await fetch(
+    `${PERSISTENCE_URL}/api/mt/customers/${CUSTOMER_ID}/documents/${DOC_ID}/versions/master/languages/${LANGUAGE}/content`,
+  )
   return res.json()
+}
+
+async function fetchChangelog() {
+  const res = await fetch(
+    `${PERSISTENCE_URL}/api/mt/customers/${CUSTOMER_ID}/documents/${DOC_ID}/versions/master/languages/${LANGUAGE}/changelog`,
+  )
+  return res.text()
 }
 
 // Polls rather than sleeping a fixed duration tied to one specific
 // GIT_CHECKPOINT_INTERVAL_MS value -- correct whether the running stack
-// uses the 60s default or a shortened override for faster testing.
-async function waitForCheckpoint(previousMarkdown, timeoutMs = 90_000) {
+// uses the 60s default or a shortened override for faster testing. Compares
+// ydoc bytes (not markdown -- the content endpoint returns only ydoc, see
+// DocumentController) since a new checkpoint always changes them.
+async function waitForCheckpoint(previousYdoc, timeoutMs = 90_000) {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
-    const doc = await fetchDoc()
-    if (doc.markdown && doc.markdown !== previousMarkdown) return doc
+    const content = await fetchContent()
+    if (content.ydoc && content.ydoc !== previousYdoc) return content
     await new Promise((r) => setTimeout(r, 2000))
   }
-  throw new Error(`timed out waiting for a new git checkpoint (still "${previousMarkdown}")`)
+  throw new Error('timed out waiting for a new git checkpoint')
 }
 
 async function main() {
+  await createCustomer()
+  await createDocument()
+
   const ydoc = new Y.Doc()
   const provider = new HocuspocusProvider({
     url: 'ws://localhost:1234',
-    name: DOC_ID,
+    name: `${CUSTOMER_ID}~${DOC_ID}@master`,
     document: ydoc,
     parameters: { userId: 'User-Alpha' },
   })
@@ -46,20 +81,20 @@ async function main() {
   frag.insert(0, [el])
 
   console.log('edit 1 made, polling for the first git checkpoint...')
-  const commitNMinus1 = await waitForCheckpoint('')
-  console.log('commit N-1 markdown:', JSON.stringify(commitNMinus1.markdown), '| has ydoc:', !!commitNMinus1.ydoc)
+  const commitNMinus1 = await waitForCheckpoint(null)
+  console.log('commit N-1 has ydoc:', !!commitNMinus1.ydoc)
 
   text.insert(text.length, 'World')
   console.log('edit 2 made, polling for the next git checkpoint...')
-  const commitN = await waitForCheckpoint(commitNMinus1.markdown)
-  console.log('commit N markdown:', JSON.stringify(commitN.markdown))
-  console.log('commit N changelog:\n' + commitN.changelog)
+  const commitN = await waitForCheckpoint(commitNMinus1.ydoc)
+  const changelogN = await fetchChangelog()
+  console.log('commit N changelog:\n' + changelogN)
 
   // --- THE VERIFICATION: replay commit N's changelog on top of commit N-1's snapshot ---
   const replay = new Y.Doc()
   Y.applyUpdate(replay, Buffer.from(commitNMinus1.ydoc, 'base64'))
 
-  const entries = commitN.changelog.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  const entries = changelogN.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
   console.log(`\nreplaying ${entries.length} changelog entr${entries.length === 1 ? 'y' : 'ies'} onto commit N-1's snapshot:`)
   for (const entry of entries) {
     console.log(`  - author=${entry.author} at ${new Date(entry.timestamp).toISOString()}, delta=${entry.delta.length} base64 chars`)

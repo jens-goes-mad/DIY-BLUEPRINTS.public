@@ -274,6 +274,10 @@ on `persistence-service` and `POST /api/documents/:docId/merge` on
 `collab-server` (the conflict-detecting one, not persistence-service's
 lower-level commit-only merge endpoint). A conflict response renders as a
 table (type, attribute, both sides' values) rather than raw JSON.
+(**Superseded 2026-09-24**: `admin.html`/`admin.js` deleted along with the
+single-tenant model they were built against -- `admin-mt.html` is now the
+one admin page. This paragraph stays as the historical record of why CORS
+was added below.)
 
 This required one real backend addition: `persistence-service` had no CORS
 configuration at all, so the browser would have silently blocked every
@@ -806,6 +810,125 @@ thread isn't picked back up for a while:
   far.
 
 ## Verified and working
+
+- **Single-tenant model retired entirely; `DocumentController` rebuilt onto
+  `DocumentStorageService`** (2026-09-24) — a multi-step RFC-then-implement
+  refactor prompted by "`DocumentController` is strictly bound to
+  `GitRepositoryService`. Do not like it." The end state:
+  - `DocumentStorageService` gained five methods that used to be either
+    concrete-only extras or missing entirely: `listDocuments`,
+    `listVersions`, `loadChangelog`, `history` (blame), `findMergeBase`.
+    The dividing line settled on for what belongs on the generic interface
+    vs. stays git-specific: "could a different backend answer this in its
+    own way" (yes for all five -- any version-aware store needs to answer
+    "what documents/versions exist," "who touched this line," "where did
+    these diverge"), not "does today's implementation happen to use git
+    for it." What stayed off the interface: `readCustomerMeta`,
+    `readDocumentMeta`, `listCustomerIds`, `listAllRefs`, `deleteCustomer`
+    -- raw metadata reads and whole-customer enumeration/deletion really
+    are implementation-specific admin operations.
+  - `DocumentController` rebuilt from scratch: constructor takes only
+    `DocumentStorageService`, no git type crosses the boundary anywhere in
+    it, every endpoint is `customerId`/`docId`/`versionName`/`language`-
+    shaped. Covers documents, versions, languages, content (load/save),
+    changelog, history, merge-base, and merge -- the full tenant-scoped
+    content API a JWT-authenticated editing session would use in the real
+    flow (JWT resolves customerId; the client's own session already knows
+    document/version/language).
+  - `MultiTenantAdminController` shrunk to exactly `listCustomers`/
+    `createCustomer`/`deleteCustomer` -- platform/ops customer lifecycle,
+    the one thing a regular user's JWT would never self-authorize, unlike
+    everything that moved to `DocumentController`. Still bound to the
+    concrete `GitDocumentStorageService` (needs the metadata/enumeration
+    extras above).
+  - `GitRepositoryService` deleted outright, along with the single-tenant
+    `/data/repo` volume (`docker-compose.yml`), its `repo.path` config
+    (`application.yml`), and its `cgitrc` entry -- `GitDocumentStorageService`
+    is now the only storage implementation in the app.
+  - `collab-server` rewired to match: `persistenceClient.js` simplified
+    back to one `loadSnapshot`/`saveSnapshot`/`findMergeBase`/`commitMerge`
+    set (no more `Tenant`-suffixed duplicates now that there's only one
+    model), `server.js`'s `parseDocumentName` dropped the `mt:` prefix
+    (no longer needed once there's nothing to distinguish from) and the
+    legacy `docId@branch` fallback entirely, `mergeBranches.js` and its
+    HTTP route now take `customerId`/`versionName`/`language` throughout.
+  - `frontend/src/main.js`: dropped the "(legacy single-tenant)" dropdown
+    entries; the flattened dropdown is purely customer/document/version
+    now. Added two states the old code never needed: no `?doc=` at all
+    now defaults to the first available document (reflected into the URL
+    via `history.replaceState`, not a reload) instead of falling back to
+    a guaranteed-to-exist "default" document, and zero documents
+    provisioned anywhere shows "No documents yet -- create a customer and
+    document via /admin-mt.html" instead of trying to connect to a bogus
+    room.
+  - **Real bug found by testing, not by reasoning about the code**: the
+    interface's `load(doc, versionName, language)` couldn't actually back
+    `collab-server`'s pre-merge conflict detection, because merge-base
+    loading needs the content *as of an arbitrary commit* (the merge-base,
+    which has no version name of its own), and `versionName` was always
+    resolved as `refs/heads/docs/<docId>/<versionName>` -- a raw commit
+    SHA passed in that slot would just fail to resolve as a ref path.
+    Fixed in `GitDocumentStorageService.load()`: try resolving as a named
+    version first, then fall back to resolving `versionName` itself as a
+    raw revision -- matches how `save()`/`createVersion()`/`findMergeBase()`
+    already document their return values as "opaque identifiers" a caller
+    can hand back in.
+  - **Also found while deploying**: leftover fast-tier files
+    (`/data/live/*.base.ydoc`/`.updates.log`) from before this refactor
+    used the old room-name shapes (`default@master`, the old `mt:`-
+    prefixed form) -- the new `parseDocumentName` doesn't special-case
+    `mt:` anymore, so it silently became part of a wrong `customerId`
+    (`"mt:cust-001"` instead of `"cust-001"`), and the startup-reconcile
+    sweep picked these up and repeatedly failed to checkpoint them (HTTP
+    500, customer not found). Deleted the stale files directly (all five
+    were pure test debris or already safely checkpointed to git under
+    their correct customerId, verified before deleting) and restarted
+    `collab-server` to drop the matching in-memory entries. One lingering
+    stale `mt:`-prefixed connection persisted through the restart, almost
+    certainly a leftover open browser tab from earlier this session
+    reconnecting via HocuspocusProvider's auto-reconnect -- not a code
+    issue, expected to clear once that tab closes/refreshes.
+  - Verified at every step: `docker build --target build` compile checks
+    after each of the six sub-changes (interface+impl, `DocumentController`
+    rewrite, `MultiTenantAdminController` strip-down, `GitRepositoryService`
+    deletion, `collab-server` rewiring, `frontend` rewiring) before ever
+    deploying; full curl coverage of every moved/new endpoint (documents,
+    versions, languages, content, changelog, history, merge-base, and
+    master-deletion protection); a real headless-browser session covering
+    both the no-`?doc=` auto-pick path and an explicit `?doc=` path,
+    typing, checkpoint landing in git, and visibility via both the new
+    `DocumentController` content endpoint and cgit directly.
+  - `frontend/admin.html`/`admin.js` (the standalone single-tenant branch-
+    admin page, non-functional once the endpoints it called were gone)
+    deleted outright -- `admin-mt.html` is the one admin page now, its
+    stale "back to branch admin" link and "prototype"/"multi-tenant"
+    framing (nothing left to distinguish from) cleaned up to match.
+  - `tests/integration/branch-merge-e2e.mjs`, `merge-with-conflict-
+    detection.mjs`, and `changelog-replay.mjs` all called the now-gone
+    single-tenant HTTP shape directly against `persistence-service:8081` --
+    checked first whether the existing unit tests (`conflict-detection.mjs`,
+    `merge-conflict-resolution.mjs`) covered the same ground before touching
+    anything: they don't (grep confirms zero unit tests call `fetch` at
+    all -- they're pure in-memory Yjs logic, never exercising git or HTTP),
+    so all three were updated to the customer/document/version/language
+    shape rather than deleted. `merge-with-conflict-detection.mjs` in
+    particular contains `testMergePreservesUnrelatedDocs`, a named
+    regression test for the real 2026-09-19 incident (an earlier `merge()`
+    silently dropped an unrelated document's content from the resulting
+    commit's tree) -- deleting it would have removed the one thing still
+    guarding against that regression recurring. The regression maps
+    directly onto the multi-tenant model: merging one docId's version must
+    not touch a different docId's content in the same customer's repo.
+    `changelog-replay.mjs` needed one structural change beyond the URL
+    shape: the content endpoint no longer returns markdown (see
+    `DocumentController`'s own comment on why), so checkpoint-detection
+    switched from polling on markdown-string changes to polling on the
+    ydoc bytes themselves -- a more direct signal anyway, since markdown
+    is derived from the ydoc, not the other way round. All three run
+    against `node:20-alpine` (no local `node` in this environment) with
+    `--network host` against the live stack and pass end to end, including
+    the regression check (`bystander ydoc unchanged: true`) and the
+    changelog-replay's byte-for-byte state-vector match.
 
 - Multi-tenant admin prototype (`admin-mt.html`, `MultiTenantAdminController`,
   `GitDocumentStorageService`) — customer creation (readable id + display

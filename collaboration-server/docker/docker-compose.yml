@@ -40,12 +40,11 @@ services:
     ports:
       - "8081:8080"
     volumes:
-      - repo-data:/data/repo
-      # Multi-tenant repo root (RFC: multi-tenant scale, STATE.md) --
-      # GitDocumentStorageService/MultiTenantAdminController's per-customer
-      # repos, separate from the single-tenant repo-data volume above.
-      # Without this, every customer repo lives only in the container's
-      # ephemeral writable layer and vanishes on the next rebuild/restart.
+      # GitDocumentStorageService's per-customer repo root (RFC:
+      # multi-tenant scale, STATE.md) -- without this, every customer repo
+      # lives only in the container's ephemeral writable layer and
+      # vanishes on the next rebuild/restart. The single-tenant "repo-data"
+      # volume this used to sit alongside was retired 2026-09-24.
       - repos-data:/data/repos
 
   git-frontend:
@@ -55,7 +54,6 @@ services:
     ports:
       - "8096:80"
     volumes:
-      - repo-data:/data/repo:ro
       - repos-data:/data/repos:ro
     depends_on:
       - persistence-service
@@ -204,7 +202,6 @@ services:
     restart: unless-stopped
 
 volumes:
-  repo-data:
   repos-data:
   live-data:
   ak-pg-certs:

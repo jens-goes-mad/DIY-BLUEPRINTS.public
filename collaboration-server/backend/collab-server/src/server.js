@@ -5,7 +5,7 @@ import express from 'express'
 import cors from 'cors'
 import { schema } from './schema.js'
 import { createMarkdownSerializer } from './markdown.js'
-import { loadSnapshot, saveSnapshot, loadTenantSnapshot, saveTenantSnapshot } from './persistenceClient.js'
+import { loadSnapshot, saveSnapshot } from './persistenceClient.js'
 import { loadLocal, appendDelta, compact, COMPACT_LOG_BYTES, listLocalDocuments } from './localStore.js'
 import { mergeBranches } from './mergeBranches.js'
 import { uploadAsset } from './artifactKeeperClient.js'
@@ -34,40 +34,33 @@ let userCounter = 0
 const liveDocuments = new Map()
 
 // Hocuspocus's documentName is the identity of a live collaboration "room" --
-// everyone connected to the same name shares one Y.Doc. A branch is encoded
-// directly into that identity ("default@feature-x") rather than treated as a
-// per-connection parameter, because it has to be: two users can't
-// collaboratively co-edit two diverged branches as if they were the same
-// live document. Old-style plain docIds (no "@") default to "master", so
-// nothing that connected before this existed breaks.
+// everyone connected to the same name shares one Y.Doc. A version is encoded
+// directly into that identity rather than treated as a per-connection
+// parameter, because it has to be: two users can't collaboratively co-edit
+// two diverged versions as if they were the same live document.
 //
-// Multi-tenant rooms are distinguished by an "mt:" prefix ("mt:acme-corp~
-// onboarding-guide@review-q3") rather than overloading the single-tenant
-// shape, so the long-working single-tenant path below is untouched by this.
-// "~" (not "/") separates customerId/docId deliberately -- documentName is
-// used directly as a fast-tier filename in localStore.js's path.join calls,
-// so a literal "/" here would silently turn into an unintended nested
-// directory that doesn't exist (found via real testing: onStoreDocument
-// failed with ENOENT until this was changed). customerId/docId are git-
-// URL-friendly slugs and never contain "~" in practice.
+// Room shape: "customerId~docId@versionName" -- in the real flow,
+// JWT/Keycloak resolves customerId and the client's own session already
+// knows document/version, same as the room name already carries today (see
+// STATE.md's 2026-09-24 entry retiring the old single-repo model this used
+// to fall back to). "~" (not "/") separates customerId/docId deliberately --
+// documentName is used directly as a fast-tier filename in localStore.js's
+// path.join calls, so a literal "/" here would silently turn into an
+// unintended nested directory that doesn't exist (found via real testing:
+// onStoreDocument failed with ENOENT until this was changed). customerId/
+// docId are git-URL-friendly slugs and never contain "~" in practice.
 // Language isn't part of the room name -- fixed to LANGUAGE for now (no
 // multi-language editing UI yet, see STATE.md); revisit if/when that's built.
 const LANGUAGE = 'en'
 
 function parseDocumentName(documentName) {
-  if (documentName.startsWith('mt:')) {
-    const rest = documentName.slice('mt:'.length) // customerId~docId@versionName
-    const at = rest.indexOf('@')
-    const path = at === -1 ? rest : rest.slice(0, at)
-    const versionName = at === -1 ? 'master' : rest.slice(at + 1)
-    const sep = path.indexOf('~')
-    const customerId = sep === -1 ? path : path.slice(0, sep)
-    const docId = sep === -1 ? '' : path.slice(sep + 1)
-    return { tenant: true, customerId, docId, branch: versionName, language: LANGUAGE }
-  }
   const at = documentName.indexOf('@')
-  if (at === -1) return { tenant: false, docId: documentName, branch: 'master' }
-  return { tenant: false, docId: documentName.slice(0, at), branch: documentName.slice(at + 1) }
+  const path = at === -1 ? documentName : documentName.slice(0, at)
+  const versionName = at === -1 ? 'master' : documentName.slice(at + 1)
+  const sep = path.indexOf('~')
+  const customerId = sep === -1 ? path : path.slice(0, sep)
+  const docId = sep === -1 ? '' : path.slice(sep + 1)
+  return { customerId, docId, branch: versionName, language: LANGUAGE }
 }
 
 const httpApp = express()
@@ -104,17 +97,17 @@ httpApp.post('/api/upload', express.raw({ type: '*/*', limit: '25mb' }), async (
 // detectConflicts finds anything (see conflicts.js for exactly what
 // counts); otherwise performs the CRDT merge and commits it, returning
 // { merged: true, commitId, parentCount }.
-httpApp.post('/api/documents/:docId/merge', async (req, res) => {
-  const { docId } = req.params
-  const { sourceBranch, targetBranch, author } = req.body
-  if (!sourceBranch || !targetBranch) {
-    return res.status(400).json({ error: 'sourceBranch and targetBranch are required' })
+httpApp.post('/api/customers/:customerId/documents/:docId/merge', async (req, res) => {
+  const { customerId, docId } = req.params
+  const { sourceVersionName, targetVersionName, language, author } = req.body
+  if (!sourceVersionName || !targetVersionName || !language) {
+    return res.status(400).json({ error: 'sourceVersionName, targetVersionName, and language are required' })
   }
   try {
-    const result = await mergeBranches(docId, sourceBranch, targetBranch, author || 'unknown')
+    const result = await mergeBranches(customerId, docId, sourceVersionName, targetVersionName, language, author || 'unknown')
     res.json(result)
   } catch (err) {
-    console.error(`[merge] failed for "${docId}" (${sourceBranch} -> ${targetBranch}):`, err.message)
+    console.error(`[merge] failed for "${customerId}/${docId}" (${sourceVersionName} -> ${targetVersionName}):`, err.message)
     res.status(500).json({ error: err.message })
   }
 })
@@ -137,11 +130,7 @@ async function checkpointToGit(documentName, entry) {
   // safe, because the individual chunks are now durable elsewhere.
   const changelog = entry.changelog.map((e) => JSON.stringify(e)).join('\n')
 
-  if (entry.tenant) {
-    await saveTenantSnapshot(entry.customerId, entry.docId, entry.branch, entry.language, ydocBytes, markdown, changelog, contributors)
-  } else {
-    await saveSnapshot(entry.docId, entry.branch, ydocBytes, markdown, changelog, contributors)
-  }
+  await saveSnapshot(entry.customerId, entry.docId, entry.branch, entry.language, ydocBytes, markdown, changelog, contributors)
   entry.dirty = false
   entry.contributors.clear()
   entry.changelog = []
@@ -212,9 +201,7 @@ const hocuspocus = Server.configure({
     }
 
     try {
-      const gitBytes = entry.tenant
-        ? await loadTenantSnapshot(entry.customerId, entry.docId, entry.branch, entry.language)
-        : await loadSnapshot(entry.docId, entry.branch)
+      const gitBytes = await loadSnapshot(entry.customerId, entry.docId, entry.branch, entry.language)
       if (!gitBytes) return
       const doc = new Y.Doc()
       Y.applyUpdate(doc, gitBytes)

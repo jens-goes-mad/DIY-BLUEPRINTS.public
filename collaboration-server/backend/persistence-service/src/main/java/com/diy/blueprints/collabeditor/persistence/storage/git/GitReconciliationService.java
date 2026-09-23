@@ -1,4 +1,4 @@
-package com.diy.blueprints.collabeditor.persistence.reconcile;
+package com.diy.blueprints.collabeditor.persistence.storage.git;
 
 import com.diy.blueprints.collabeditor.persistence.index.DocumentIndexService;
 import com.diy.blueprints.collabeditor.persistence.index.entity.Branch;
@@ -6,7 +6,6 @@ import com.diy.blueprints.collabeditor.persistence.index.entity.Customer;
 import com.diy.blueprints.collabeditor.persistence.index.entity.Document;
 import com.diy.blueprints.collabeditor.persistence.storage.DocumentMeta;
 import com.diy.blueprints.collabeditor.persistence.storage.DocumentRef;
-import com.diy.blueprints.collabeditor.persistence.storage.GitDocumentStorageService;
 import com.diy.blueprints.collabeditor.persistence.storage.StorageException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
