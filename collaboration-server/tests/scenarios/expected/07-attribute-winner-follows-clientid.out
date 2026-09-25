@@ -1,0 +1,33 @@
+# scenario: 07-attribute-winner-follows-clientid.scn
+> doc master
+  master @c0:
+    [heading level=1] Title
+> branch review from master
+  review created from master @c0
+> as bob   on review  set p1 level=3
+  review @c0 +uncommitted:
+    [heading level=3] Title
+> as alice on master  set p1 level=2
+  master @c0 +uncommitted:
+    [heading level=2] Title
+> merge review -> master
+  merge base c0 (source @c1, target @c2)
+  conflicts: 1
+    {"type":"attribute","attribute":"level","base":1,"valueA":2,"valueB":3}
+  REFUSED, master unchanged
+> expect merged false
+  ok
+> expect conflict attribute level
+  ok
+> merge review -> master force
+  merge base c0 (source @c1, target @c2)
+  conflicts: 1
+    {"type":"attribute","attribute":"level","base":1,"valueA":2,"valueB":3}
+  MERGED as c3 (parents c2, c1) -- forced past the conflicts above
+  master @c3:
+    [heading level=2] Title
+> show master
+  master @c3:
+    [heading level=2] Title
+
+# result: ok

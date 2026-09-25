@@ -1,0 +1,63 @@
+# scenario: 06-remerge-uses-latest-base.scn
+> doc master
+  master @c0:
+    [para] One.
+    [para] Two.
+> branch review from master
+  review created from master @c0
+> as bob on review  insert p1 at end " (review)"
+  review @c0 +uncommitted:
+    [para] One. (review)
+    [para] Two.
+> merge review -> master
+  merge base c0 (source @c1, target @c0)
+  conflicts: 0
+  MERGED as c2 (parents c0, c1)
+  master @c2:
+    [para] One. (review)
+    [para] Two.
+> expect merged true
+  ok
+> branch hotfix from master
+  hotfix created from master @c2
+> as carol on hotfix  insert p2 at end " (hotfix)"
+  hotfix @c2 +uncommitted:
+    [para] One. (review)
+    [para] Two. (hotfix)
+> as alice on master  insert p1 at end " (master again)"
+  master @c2 +uncommitted:
+    [para] One. (review) (master again)
+    [para] Two.
+> as bob   on review  add para at end "Three (review, round 2)."
+  review @c1 +uncommitted:
+    [para] One. (review)
+    [para] Two.
+    [para] Three (review, round 2).
+> merge review -> master
+  merge base c1 (source @c3, target @c4)
+  conflicts: 0
+  MERGED as c5 (parents c4, c3)
+  master @c5:
+    [para] One. (review) (master again)
+    [para] Two.
+    [para] Three (review, round 2).
+> expect merged true
+  ok
+> expect conflicts 0
+  ok
+> merge hotfix -> master
+  merge base c2 (source @c6, target @c5)
+  conflicts: 0
+  MERGED as c7 (parents c5, c6)
+  master @c7:
+    [para] One. (review) (master again)
+    [para] Two. (hotfix)
+    [para] Three (review, round 2).
+> expect merged true
+  ok
+> expect conflicts 0
+  ok
+> expect doc master
+  ok
+
+# result: ok

@@ -3,7 +3,7 @@ import { yDocToProsemirrorJSON } from 'y-prosemirror'
 import { schema } from './schema.js'
 import { createMarkdownSerializer } from './markdown.js'
 import { loadSnapshot, findMergeBase, commitMerge } from './persistenceClient.js'
-import { detectConflicts } from './conflicts.js'
+import { mergeDocs } from './mergeDocs.js'
 
 const YJS_FIELD = 'default'
 const markdownSerializer = createMarkdownSerializer()
@@ -44,13 +44,12 @@ export async function mergeBranches(customerId, docId, sourceVersionName, target
   const targetDoc = docFromBytes(targetBytes)
   const sourceDoc = docFromBytes(sourceBytes)
 
-  const conflicts = detectConflicts(baseDoc, targetDoc, sourceDoc, YJS_FIELD)
-  if (conflicts.length > 0) {
-    return { merged: false, conflicts }
+  const result = mergeDocs(baseDoc, targetDoc, sourceDoc, { field: YJS_FIELD })
+  if (!result.merged) {
+    return { merged: false, conflicts: result.conflicts }
   }
 
-  Y.applyUpdate(targetDoc, Y.encodeStateAsUpdate(sourceDoc))
-  const mergedBytes = Y.encodeStateAsUpdate(targetDoc)
+  const mergedBytes = result.mergedBytes
   const docJSON = yDocToProsemirrorJSON(targetDoc, YJS_FIELD)
   const node = schema.nodeFromJSON(docJSON)
   const markdown = markdownSerializer.serialize(node)

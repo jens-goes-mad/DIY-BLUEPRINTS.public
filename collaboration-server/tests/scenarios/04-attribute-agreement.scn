@@ -1,0 +1,15 @@
+# Both sides set the same attribute to the SAME value: not a conflict.
+
+doc master
+  heading level=1 "Title"
+
+branch review from master
+
+as alice on master  set p1 level=2
+as bob   on review  set p1 level=2
+
+merge review -> master
+expect merged true
+expect conflicts 0
+expect doc master
+  heading level=2 "Title"

@@ -1,0 +1,27 @@
+# scenario: 02-concurrent-insert-same-spot.scn
+> doc master
+  master @c0:
+    [para] The quick fox.
+> branch review from master
+  review created from master @c0
+> as alice on master  insert p1 after "quick" " brown"
+  master @c0 +uncommitted:
+    [para] The quick brown fox.
+> as bob   on review  insert p1 after "quick" " red"
+  review @c0 +uncommitted:
+    [para] The quick red fox.
+> merge review -> master
+  merge base c0 (source @c1, target @c2)
+  conflicts: 0
+  MERGED as c3 (parents c2, c1)
+  master @c3:
+    [para] The quick brown red fox.
+> expect merged true
+  ok
+> expect conflicts 0
+  ok
+> show master
+  master @c3:
+    [para] The quick brown red fox.
+
+# result: ok

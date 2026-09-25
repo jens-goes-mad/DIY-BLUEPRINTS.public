@@ -1,0 +1,26 @@
+# scenario: 04-attribute-agreement.scn
+> doc master
+  master @c0:
+    [heading level=1] Title
+> branch review from master
+  review created from master @c0
+> as alice on master  set p1 level=2
+  master @c0 +uncommitted:
+    [heading level=2] Title
+> as bob   on review  set p1 level=2
+  review @c0 +uncommitted:
+    [heading level=2] Title
+> merge review -> master
+  merge base c0 (source @c1, target @c2)
+  conflicts: 0
+  MERGED as c3 (parents c2, c1)
+  master @c3:
+    [heading level=2] Title
+> expect merged true
+  ok
+> expect conflicts 0
+  ok
+> expect doc master
+  ok
+
+# result: ok

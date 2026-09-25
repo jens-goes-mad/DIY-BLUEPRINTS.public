@@ -1,0 +1,18 @@
+# Two users insert different words at the SAME position of the same sentence.
+# Yjs never flags this: it keeps both insertions and orders them by clientID.
+# The order below is therefore not a spec -- it is characterization of a
+# deterministic tie-break (see the golden transcript) -- but "no conflict" and
+# "both words survive" are asserted.
+
+doc master
+  para "The quick fox."
+
+branch review from master
+
+as alice on master  insert p1 after "quick" " brown"
+as bob   on review  insert p1 after "quick" " red"
+
+merge review -> master
+expect merged true
+expect conflicts 0
+show master

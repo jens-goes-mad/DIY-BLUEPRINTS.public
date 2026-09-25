@@ -1,0 +1,22 @@
+# Both sides change the same heading's level to different values.
+# detectConflicts flags it and the real pipeline REFUSES the merge.
+# The second merge uses "force" to preview what plain Yjs would do anyway
+# (last-writer-wins on the attribute) -- the real pipeline never does this.
+
+doc master
+  heading level=1 "Title"
+  para "Body."
+
+branch review from master
+
+as alice on master  set p1 level=2
+as bob   on review  set p1 level=3
+
+merge review -> master
+expect merged false
+expect conflict attribute level
+show master
+
+merge review -> master force
+expect merged true
+show master

@@ -811,6 +811,52 @@ thread isn't picked back up for a while:
 
 ## Verified and working
 
+- **Scenario test suite for versions/edits/merges** (2026-09-25) --
+  `tests/scenarios/`: plain-text `.scn` scripts (branch, insert/replace/
+  delete/set/add, merge, expect) played against real Y.Docs, producing a
+  transcript per scenario that is compared with a committed
+  `expected/*.out`, plus inline `expect` assertions. Built on a new pure
+  `mergeDocs(base, target, source, {force})` extracted from
+  `mergeBranches.js`, so the runner and the live pipeline execute the same
+  merge logic; `force` (never used by the pipeline) previews what Yjs does
+  when conflicts are ignored. Seven starter scenarios; the runner was itself
+  verified to FAIL (exit 1) on a wrong expectation, a bad anchor and a
+  tampered golden file, and the real `merge-with-conflict-detection.mjs`
+  integration test passes unchanged against the redeployed `collab-server`.
+  Findings the scenarios surfaced: (a) concurrent text inserts at the same
+  spot never conflict -- both survive, ordered by clientID; (b) a forced
+  attribute collision is decided by **clientID, not time or merge direction**
+  (scenarios 03 vs 07 flip the winner just by introducing the users in the
+  opposite order) -- so the "last-writer-wins" wording elsewhere in these
+  docs is loose, and in the real app (random per-session clientIDs) the
+  winner is effectively arbitrary; (c) with `force`, delete-vs-edit lets the
+  deletion win and silently drops the other side's edit; (d) one edit can
+  yield several delete-vs-edit records (a paragraph is several Yjs items).
+  Still deferred: replaying a scenario against the live stack to compare the
+  git-stored result with the in-memory one, and users editing the *same*
+  version concurrently (`sync`).
+- **Incident 2026-09-24: auto-commit silently failing for a whole day, and
+  the recovery.** The editor tabs were still on the pre-refactor room name
+  `mt:cust-001~...`; after the `mt:` prefix was dropped from
+  `parseDocumentName`, the literal `mt:` became part of the customerId, so
+  every checkpoint 500'd (`repository not found: /data/repos/mt:cust-001.git`)
+  and the tabs kept accepting edits that could never reach git. Nothing was
+  lost -- edits sat in the fast tier (`/data/live`) -- and the last good
+  commit was 21:53 the day before. Recovered by moving the fast-tier files
+  to the correct room name after verifying the stale state was a strict
+  superset of git's (state-vector comparison), letting startup-reconcile
+  check it in. Not yet done (only the recovery was requested): redirect
+  `?doc=mt:...` in the frontend, and make `collab-server` reject a room whose
+  customer doesn't exist instead of accepting unsaveable edits.
+- **Found during that recovery, NOT fixed: `localStore.compact()` is not
+  crash-safe.** It uses `fs.writeFile`, which truncates the file in place;
+  a stop that kills the process mid-write leaves an EMPTY base file, and the
+  log is truncated right after -- so everything since the last git checkpoint
+  is gone if that ever coincides with a failing checkpoint. It happened here
+  (a `docker compose stop` zeroed a 646-byte base; only an earlier copy saved
+  the edit). Fix is small (write to a temp file, fsync, rename), separate
+  change, needs a decision.
+
 - **Single-tenant model retired entirely; `DocumentController` rebuilt onto
   `DocumentStorageService`** (2026-09-24) — a multi-step RFC-then-implement
   refactor prompted by "`DocumentController` is strictly bound to

@@ -1,0 +1,31 @@
+# Merge the same version twice, with another branch in between. The second
+# merge's base must be the state after the FIRST merge, not the original
+# master -- otherwise round-one edits would be re-applied or re-flagged.
+# All edits touch different places so no tie-breaks are involved.
+
+doc master
+  para "One."
+  para "Two."
+
+branch review from master
+as bob on review  insert p1 at end " (review)"
+
+merge review -> master
+expect merged true
+
+branch hotfix from master
+as carol on hotfix  insert p2 at end " (hotfix)"
+as alice on master  insert p1 at end " (master again)"
+as bob   on review  add para at end "Three (review, round 2)."
+
+merge review -> master
+expect merged true
+expect conflicts 0
+
+merge hotfix -> master
+expect merged true
+expect conflicts 0
+expect doc master
+  para "One. (review) (master again)"
+  para "Two. (hotfix)"
+  para "Three (review, round 2)."

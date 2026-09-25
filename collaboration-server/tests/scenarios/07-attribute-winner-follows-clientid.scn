@@ -1,0 +1,20 @@
+# Same collision as 03, but the two users are introduced in the opposite
+# order, which swaps their fixed clientIDs (see scenario.mjs). If the forced
+# outcome flips, "who wins" is decided by clientID -- NOT by which edit came
+# later or which side was merged into which. Characterization, not a spec:
+# in the real app clientIDs are random per browser session.
+
+doc master
+  heading level=1 "Title"
+
+branch review from master
+
+as bob   on review  set p1 level=3
+as alice on master  set p1 level=2
+
+merge review -> master
+expect merged false
+expect conflict attribute level
+
+merge review -> master force
+show master

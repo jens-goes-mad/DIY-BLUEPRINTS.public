@@ -94,7 +94,7 @@ ports: `1234`/`3000` for collab-server, `8081` for persistence-service).
   whatever `GIT_CHECKPOINT_INTERVAL_MS` the running stack is using (default
   60s — so this one's slow by design, not a shortcut worth taking).
 - **`merge-with-conflict-detection.mjs`** — exercises collab-server's real
-  `POST /api/documents/:docId/merge` endpoint both ways against the live
+  `POST /api/customers/:customerId/documents/:docId/merge` endpoint both ways against the live
   stack: a clean divergence merges and commits with a real two-parent
   commit; a divergence where both branches change the same attribute to
   different values returns exactly one correctly-typed conflict and —
@@ -106,6 +106,14 @@ node integration/branch-merge-e2e.mjs
 node integration/changelog-replay.mjs
 node integration/merge-with-conflict-detection.mjs
 ```
+
+## `scenarios/` — plain-text version/edit/merge scripts, played against real Yjs
+
+Readable scripts (`branch`, `insert`, `delete`, `set`, `merge`, ...) with a
+transcript per scenario showing the document after every step and how
+conflicts are detected or resolved. Uses the real `mergeDocs.js`. See
+[`scenarios/README.md`](scenarios/README.md) for the command reference and how
+to run it.
 
 ## `jgit-merge-mechanics/` — standalone Java/JGit proof, no app code involved
 

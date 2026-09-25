@@ -1,0 +1,20 @@
+# One side deletes a paragraph while the other edits text inside it.
+# detectConflicts flags delete-vs-edit and the merge is refused; "force"
+# shows what Yjs makes of it (characterization, not a spec).
+
+doc master
+  para "Keep me."
+  para "Delete me on master, edit me on review."
+
+branch review from master
+
+as alice on master  delete p2
+as bob   on review  replace p2 "edit me" -> "EDIT ME"
+
+merge review -> master
+expect merged false
+expect conflict delete-vs-edit
+
+merge review -> master force
+expect merged true
+show master

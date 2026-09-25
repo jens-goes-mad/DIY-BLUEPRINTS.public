@@ -1,0 +1,39 @@
+# scenario: 05-delete-vs-edit.scn
+> doc master
+  master @c0:
+    [para] Keep me.
+    [para] Delete me on master, edit me on review.
+> branch review from master
+  review created from master @c0
+> as alice on master  delete p2
+  master @c0 +uncommitted:
+    [para] Keep me.
+> as bob   on review  replace p2 "edit me" -> "EDIT ME"
+  review @c0 +uncommitted:
+    [para] Keep me.
+    [para] Delete me on master, EDIT ME on review.
+> merge review -> master
+  merge base c0 (source @c1, target @c2)
+  conflicts: 2
+    {"type":"delete-vs-edit","deletedBySide":"A","editedBySide":"B","targetId":"1:39"}
+    {"type":"delete-vs-edit","deletedBySide":"A","editedBySide":"B","targetId":"1:40"}
+  REFUSED, master unchanged
+> expect merged false
+  ok
+> expect conflict delete-vs-edit
+  ok
+> merge review -> master force
+  merge base c0 (source @c1, target @c2)
+  conflicts: 2
+    {"type":"delete-vs-edit","deletedBySide":"A","editedBySide":"B","targetId":"1:39"}
+    {"type":"delete-vs-edit","deletedBySide":"A","editedBySide":"B","targetId":"1:40"}
+  MERGED as c3 (parents c2, c1) -- forced past the conflicts above
+  master @c3:
+    [para] Keep me.
+> expect merged true
+  ok
+> show master
+  master @c3:
+    [para] Keep me.
+
+# result: ok

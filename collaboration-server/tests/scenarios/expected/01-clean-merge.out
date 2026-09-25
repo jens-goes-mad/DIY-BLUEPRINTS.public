@@ -1,0 +1,41 @@
+# scenario: 01-clean-merge.scn
+> doc master
+  master @c0:
+    [heading level=1] Notes
+    [para] Alpha.
+    [para] Beta.
+> branch review from master
+  review created from master @c0
+> as alice on master  replace p2 "Alpha" -> "Alpha (revised)"
+  master @c0 +uncommitted:
+    [heading level=1] Notes
+    [para] Alpha (revised).
+    [para] Beta.
+> as bob   on review  insert p3 at end " More beta."
+  review @c0 +uncommitted:
+    [heading level=1] Notes
+    [para] Alpha.
+    [para] Beta. More beta.
+> as bob   on review  add para after p3 "Gamma, added on review."
+  review @c0 +uncommitted:
+    [heading level=1] Notes
+    [para] Alpha.
+    [para] Beta. More beta.
+    [para] Gamma, added on review.
+> merge review -> master
+  merge base c0 (source @c1, target @c2)
+  conflicts: 0
+  MERGED as c3 (parents c2, c1)
+  master @c3:
+    [heading level=1] Notes
+    [para] Alpha (revised).
+    [para] Beta. More beta.
+    [para] Gamma, added on review.
+> expect merged true
+  ok
+> expect conflicts 0
+  ok
+> expect doc master
+  ok
+
+# result: ok

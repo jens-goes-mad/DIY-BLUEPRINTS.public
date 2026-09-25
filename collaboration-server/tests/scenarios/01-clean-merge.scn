@@ -1,0 +1,22 @@
+# Both sides edit DIFFERENT paragraphs and review adds a new one.
+# Nothing overlaps, so this must merge cleanly with every edit present.
+
+doc master
+  heading level=1 "Notes"
+  para "Alpha."
+  para "Beta."
+
+branch review from master
+
+as alice on master  replace p2 "Alpha" -> "Alpha (revised)"
+as bob   on review  insert p3 at end " More beta."
+as bob   on review  add para after p3 "Gamma, added on review."
+
+merge review -> master
+expect merged true
+expect conflicts 0
+expect doc master
+  heading level=1 "Notes"
+  para "Alpha (revised)."
+  para "Beta. More beta."
+  para "Gamma, added on review."
