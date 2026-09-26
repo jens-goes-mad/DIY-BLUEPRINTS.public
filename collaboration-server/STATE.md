@@ -848,14 +848,26 @@ thread isn't picked back up for a while:
   check it in. Not yet done (only the recovery was requested): redirect
   `?doc=mt:...` in the frontend, and make `collab-server` reject a room whose
   customer doesn't exist instead of accepting unsaveable edits.
-- **Found during that recovery, NOT fixed: `localStore.compact()` is not
-  crash-safe.** It uses `fs.writeFile`, which truncates the file in place;
-  a stop that kills the process mid-write leaves an EMPTY base file, and the
-  log is truncated right after -- so everything since the last git checkpoint
-  is gone if that ever coincides with a failing checkpoint. It happened here
-  (a `docker compose stop` zeroed a 646-byte base; only an earlier copy saved
-  the edit). Fix is small (write to a temp file, fsync, rename), separate
-  change, needs a decision.
+- **Found during that recovery, then fixed (2026-09-27): `localStore.compact()`
+  was not crash-safe.** It used `fs.writeFile`, which truncates the target
+  before writing, so a stop that killed the process mid-write left an EMPTY
+  base file (and the log was truncated right after) -- everything since the
+  last git checkpoint gone if that coincided with failing checkpoints. It
+  happened here: a `docker compose stop` zeroed a 646-byte base and only an
+  earlier copy saved the edit. Now the base is written to a unique temp file,
+  fsynced and renamed over the target (atomic), and the log is truncated only
+  afterwards -- a crash between the two leaves the new base plus an old log
+  whose deltas it already contains, which is harmless because Yjs updates are
+  idempotent. Temp names are unique per call because compactions of the same
+  document really do overlap (seen in the logs), and the `.tmp` suffix keeps
+  leftovers out of `listLocalDocuments`. New `tests/unit/local-store-
+  compact.mjs` simulates a kill mid-write and before the rename; verified it
+  FAILS on the original code with "Unexpected end of array" -- the same error
+  startup-reconcile logged on the real zeroed file -- and passes on the fix.
+  Verified live too: a real editing session compacted correctly, including
+  overlapping compactions, with no temp files left. Not covered: fsync of the
+  directory after the rename (would matter for a power loss, not a process
+  kill).
 
 - **Single-tenant model retired entirely; `DocumentController` rebuilt onto
   `DocumentStorageService`** (2026-09-24) — a multi-step RFC-then-implement

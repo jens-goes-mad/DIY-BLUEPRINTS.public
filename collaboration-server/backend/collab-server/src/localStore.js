@@ -81,8 +81,40 @@ export async function appendDelta(docId, deltaBytes) {
  */
 export async function compact(docId, fullStateBytes) {
   await fs.mkdir(LIVE_STORE_PATH, { recursive: true })
-  await fs.writeFile(basePath(docId), fullStateBytes)
+  await writeFileAtomic(basePath(docId), fullStateBytes)
+  // Only after the new base is safely in place. A crash between these two
+  // steps leaves the new base plus the old log, whose deltas the base
+  // already contains -- re-applying them is a no-op (Yjs updates are
+  // idempotent), so it's safe; the reverse order would not be.
   await fs.writeFile(logPath(docId), Buffer.alloc(0))
+}
+
+let tmpCounter = 0
+
+// A plain fs.writeFile truncates the target FIRST and then writes, so a
+// process kill in between (docker stop's SIGKILL after its grace period)
+// leaves an EMPTY file -- exactly how a whole document's fast-tier base was
+// lost on 2026-09-24. Writing a complete temp file and renaming it over the
+// target makes the swap atomic: readers and a crash only ever see the old
+// file or the new one. The temp name is unique per call because compactions
+// of the same document do overlap (afterUnloadDocument racing a size-triggered
+// one) and must not write into each other's file; the ".tmp" suffix keeps
+// leftovers invisible to listLocalDocuments.
+async function writeFileAtomic(filePath, bytes) {
+  const tmp = `${filePath}.${process.pid}.${tmpCounter++}.tmp`
+  try {
+    const handle = await fs.open(tmp, 'w')
+    try {
+      await handle.writeFile(bytes)
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    await fs.rename(tmp, filePath)
+  } catch (err) {
+    await fs.rm(tmp, { force: true })
+    throw err
+  }
 }
 
 /**

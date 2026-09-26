@@ -50,6 +50,12 @@ section below, it needs a second, separate install.
   attribute *overwrite* (not first-write), and an attribute overwrite's
   implicit DeleteSet tombstone being double-counted as a phantom deletion.
   See STATE.md for the full story.
+- **`local-store-compact.mjs`** — crash safety of the fast tier's
+  `compact()`. Simulates a process kill mid-write and before the atomic
+  rename and asserts the previous base survives intact, no temp files are
+  left, and overlapping compactions of one document don't corrupt each
+  other. Regression test for a real loss (2026-09-24, see STATE.md): fails
+  on the original `fs.writeFile` implementation.
 
 Run any of them directly:
 
