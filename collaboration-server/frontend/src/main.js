@@ -22,7 +22,18 @@ const CURSOR_COLORS = ['#f44336', '#2196f3', '#4caf50', '#ff9800', '#9c27b0', '#
 // doubles as a fast-tier filename in collab-server's localStore.js, where
 // a literal "/" would turn into an unintended nested directory.
 function currentDocKey() {
-  return new URLSearchParams(window.location.search).get('doc')
+  const url = new URL(window.location.href)
+  const doc = url.searchParams.get('doc')
+  // Bookmarks/tabs from before the single-tenant model was retired
+  // (2026-09-24) carry "?doc=mt:<customer>~..." -- the "mt:" prefix is gone
+  // from room names, and connecting with it would target a customer that
+  // doesn't exist. Strip it and fix the address bar in place (no reload).
+  if (doc && doc.startsWith('mt:')) {
+    url.searchParams.set('doc', doc.slice('mt:'.length))
+    window.history.replaceState({}, '', url)
+    return doc.slice('mt:'.length)
+  }
+  return doc
 }
 
 async function fetchDocEntries() {
@@ -186,6 +197,16 @@ async function main() {
         return true
       },
     },
+  })
+
+  // collab-server refuses rooms whose customer doesn't exist with close code
+  // 4401 (the one code the provider treats as permanent -- see server.js).
+  // Without this the tab would look like a working editor that never syncs.
+  provider.on('close', ({ event }) => {
+    if (event.code === 4401) {
+      editor.setEditable(false)
+      document.getElementById('user-badge').textContent = `Not connected -- ${event.reason}`
+    }
   })
 
   buildToolbar(editor)

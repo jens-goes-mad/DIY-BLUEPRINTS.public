@@ -38,6 +38,41 @@ export async function saveSnapshot(customerId, docId, versionName, language, ydo
   if (!res.ok) throw new Error(`persistence-service save failed: ${res.status}`)
 }
 
+// false ONLY on a definitive "no such customer" (404). If persistence-service
+// can't be reached or errors, answer true (fail open): the fast tier already
+// protects edits while it's down, and locking every editor out because a
+// dependency restarted would be worse than the case this guards against --
+// a room whose customer doesn't exist, whose edits could never be saved.
+export async function customerExists(customerId) {
+  let res
+  try {
+    res = await fetch(`${PERSISTENCE_URL}/api/mt/customers/${encodeURIComponent(customerId)}`)
+  } catch {
+    return true
+  }
+  return res.status !== 404
+}
+
+// Both fields come from ONE persistence-service call, resolved off the same
+// tip commit server-side -- deliberately not two separate GETs. An earlier
+// version of this split them (a previous-content call plus a changelog
+// call); a checkpoint landing on the ref between the two round trips
+// silently mixed states from two different commits (found by testing --
+// see DocumentStorageService.loadRecentChanges's own javadoc).
+export async function loadRecentChanges(customerId, docId, versionName, language) {
+  const url =
+    `${PERSISTENCE_URL}/api/mt/customers/${encodeURIComponent(customerId)}/documents/` +
+    `${encodeURIComponent(docId)}/versions/${encodeURIComponent(versionName)}/languages/` +
+    `${encodeURIComponent(language)}/recent-changes`
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`persistence-service recent-changes load failed: ${res.status}`)
+  const body = await res.json()
+  return {
+    previousBytes: body.previousYdoc ? Buffer.from(body.previousYdoc, 'base64') : null,
+    changelog: body.changelog ?? '',
+  }
+}
+
 export async function findMergeBase(customerId, docId, versionA, versionB) {
   const url =
     `${PERSISTENCE_URL}/api/mt/customers/${encodeURIComponent(customerId)}/documents/` +

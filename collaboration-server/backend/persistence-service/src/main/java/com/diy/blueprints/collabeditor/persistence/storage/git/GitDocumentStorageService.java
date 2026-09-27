@@ -79,8 +79,8 @@ import java.util.stream.Collectors;
  * the other, and exposing them separately only invited leaking *how* git
  * durably records identity (a file every branch inherits via ordinary
  * ancestry) as if that were itself a generic operation. readCustomerMeta(),
- * readDocumentMeta(), listCustomerIds(), listAllRefs(), and
- * deleteCustomer(), below, are deliberately NOT part of DocumentStorageService
+ * readDocumentMeta(), listCustomerIds(), customerExists(), listAllRefs(),
+ * and deleteCustomer(), below, are deliberately NOT part of DocumentStorageService
  * -- reading raw customer/document metadata and enumerating/deleting whole
  * customers really are git-specific (or at least implementation-specific)
  * admin operations, unlike listDocuments/listVersions/history/
@@ -320,6 +320,45 @@ public class GitDocumentStorageService implements DocumentStorageService {
         try (ObjectReader reader = repo.newObjectReader()) {
           return Optional.of(reader.open(blobId).getBytes());
         }
+      }
+    });
+  }
+
+  @Override
+  public RecentChanges loadRecentChanges(DocumentRef doc, String versionName, String language) {
+    return unchecked("failed to load recent changes for " + doc.docId() + "/" + language, () -> {
+      try (Repository repo = openRepo(doc.customerId()); RevWalk revWalk = new RevWalk(repo)) {
+        ObjectId tipId = repo.resolve(refName(doc, versionName));
+        if (tipId == null) tipId = repo.resolve(versionName); // see load()'s own comment
+        if (tipId == null) return new RecentChanges(null, "");
+
+        // Read tip's own changelog and (from its parent) the previous
+        // checkpoint's content off this SAME resolved tipId -- see this
+        // method's javadoc for why that matters.
+        String changelogJson = "";
+        ObjectId changelogBlobId = repo.resolve(tipId.getName() + ":" + languageDir(doc, language) + "/changelog.jsonl");
+        if (changelogBlobId != null) {
+          try (ObjectReader reader = repo.newObjectReader()) {
+            changelogJson = new String(reader.open(changelogBlobId).getBytes(), StandardCharsets.UTF_8);
+          }
+        }
+
+        byte[] previousContent = null;
+        RevCommit tip = revWalk.parseCommit(tipId);
+        // merge() commits carry two parents; parent 0 is target's own
+        // history, which is the one "the previous checkpoint" means here --
+        // the same side load()'s versionName-based path would trace.
+        if (tip.getParentCount() > 0) {
+          ObjectId parentId = tip.getParent(0);
+          ObjectId blobId = repo.resolve(parentId.getName() + ":" + languageDir(doc, language) + "/content.ydoc");
+          if (blobId != null) {
+            try (ObjectReader reader = repo.newObjectReader()) {
+              previousContent = reader.open(blobId).getBytes();
+            }
+          }
+        }
+
+        return new RecentChanges(previousContent, changelogJson);
       }
     });
   }
@@ -590,6 +629,20 @@ public class GitDocumentStorageService implements DocumentStorageService {
    * MultiTenantAdminController's confirmation dialog is the safety
    * mechanism here, not a technical guard.
    */
+  /**
+   * NOT part of the DocumentStorageService interface -- same category as
+   * listCustomerIds. A cheap, definitive "is there a repo for this
+   * customerId" (unlike listDocuments/load, which fail with an opaque
+   * StorageException for an unknown customer). collab-server asks this
+   * before accepting a live editing connection, so edits to a room whose
+   * customer doesn't exist -- which could never be saved -- are refused up
+   * front instead of silently piling up in the fast tier.
+   */
+  public boolean customerExists(String customerId) {
+    Path path = repoPath(customerId);
+    return Files.exists(path.resolve(".git")) || Files.exists(path.resolve("HEAD"));
+  }
+
   public synchronized void deleteCustomer(String customerId) {
     unchecked("failed to delete customer " + customerId, () -> deleteRecursively(repoPath(customerId)));
   }

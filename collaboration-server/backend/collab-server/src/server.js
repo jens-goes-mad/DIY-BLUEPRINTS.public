@@ -5,7 +5,8 @@ import express from 'express'
 import cors from 'cors'
 import { schema } from './schema.js'
 import { createMarkdownSerializer } from './markdown.js'
-import { loadSnapshot, saveSnapshot } from './persistenceClient.js'
+import { loadSnapshot, saveSnapshot, customerExists, loadRecentChanges } from './persistenceClient.js'
+import { diffChangelog, parseChangelog } from './changelogDiff.js'
 import { loadLocal, appendDelta, compact, COMPACT_LOG_BYTES, listLocalDocuments } from './localStore.js'
 import { mergeBranches } from './mergeBranches.js'
 import { uploadAsset } from './artifactKeeperClient.js'
@@ -112,6 +113,25 @@ httpApp.post('/api/customers/:customerId/documents/:docId/merge', async (req, re
   }
 })
 
+// Readable "who changed what" for a checkpoint's changelog: for each save,
+// what changed since the previous save, word-diffed and attributed. Nothing
+// stored -- reconstructed on every call from the previous checkpoint plus
+// the current changelog (see changelogDiff.js's own caveats: entry count
+// tracks the *changelog's* size, which only clears on a successful
+// checkpoint -- see STATE.md's note on why a stuck checkpoint can make this
+// one call replay far more entries than one normal ~60s window ever would).
+httpApp.get('/api/customers/:customerId/documents/:docId/versions/:versionName/languages/:language/changes', async (req, res) => {
+  const { customerId, docId, versionName, language } = req.params
+  try {
+    const { previousBytes, changelog } = await loadRecentChanges(customerId, docId, versionName, language)
+    const entries = parseChangelog(changelog)
+    res.json({ changes: diffChangelog(previousBytes, entries) })
+  } catch (err) {
+    console.error(`[changes] failed for "${customerId}/${docId}@${versionName}/${language}":`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
 httpApp.listen(HTTP_PORT, () => {
   console.log(`collab-server HTTP API listening on :${HTTP_PORT}`)
 })
@@ -163,6 +183,20 @@ const hocuspocus = Server.configure({
   maxDebounce: 30000,
 
   onConnect: async ({ documentName, requestParameters }) => {
+    // Refuse a room whose customer doesn't exist. Before this, such a room
+    // was accepted, every git checkpoint for it failed (HTTP 500) forever,
+    // and the editors' work piled up unsaveable in the fast tier -- exactly
+    // how a stale pre-refactor room name ("mt:cust-001~...") silently lost a
+    // day of auto-commits on 2026-09-24. 4401 (Hocuspocus's Unauthorized)
+    // is used on purpose: it is the one close code the browser provider
+    // treats as permanent and stops reconnecting on; any other code makes it
+    // retry forever. The reason string reaches the client (max 123 bytes).
+    const { customerId } = parseDocumentName(documentName)
+    if (!(await customerExists(customerId))) {
+      console.error(`[onConnect] rejected "${documentName}": no customer "${customerId}"`)
+      throw { code: 4401, reason: `unknown customer "${customerId}"`.slice(0, 120) }
+    }
+
     const userId = requestParameters.get('userId') || 'unknown'
     console.log(`connect -> document "${documentName}" as ${userId}`)
     return { userId }

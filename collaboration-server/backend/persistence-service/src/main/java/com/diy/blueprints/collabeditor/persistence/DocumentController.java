@@ -109,6 +109,24 @@ public class DocumentController {
         .orElse(new ContentResponse(null));
   }
 
+  // Backs a readable, decoded diff of the most recent checkpoint's
+  // changelog (see collab-server's changelogDiff.js). Both fields are
+  // resolved off the SAME tip commit in one read on the storage side --
+  // deliberately not two separate GETs (one for the previous content, one
+  // for the changelog): a checkpoint landing on the ref between two such
+  // calls would silently mix states from different commits (found by
+  // testing -- see DocumentStorageService.loadRecentChanges's javadoc).
+  public record RecentChangesResponse(String previousYdoc, String changelog) {}
+
+  @GetMapping("/customers/{customerId}/documents/{docId}/versions/{versionName}/languages/{language}/recent-changes")
+  public RecentChangesResponse recentChanges(@PathVariable String customerId, @PathVariable String docId,
+                                              @PathVariable String versionName, @PathVariable String language) {
+    DocumentRef doc = new DocumentRef(customerId, docId);
+    DocumentStorageService.RecentChanges changes = storage.loadRecentChanges(doc, versionName, language);
+    String previousYdoc = changes.previousContent() == null ? null : Base64.getEncoder().encodeToString(changes.previousContent());
+    return new RecentChangesResponse(previousYdoc, changes.changelogJson());
+  }
+
   @PutMapping("/customers/{customerId}/documents/{docId}/versions/{versionName}/languages/{language}/content")
   public void save(@PathVariable String customerId, @PathVariable String docId,
                     @PathVariable String versionName, @PathVariable String language,

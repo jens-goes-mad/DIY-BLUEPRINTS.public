@@ -2,7 +2,9 @@ package com.diy.blueprints.collabeditor.persistence;
 
 import com.diy.blueprints.collabeditor.persistence.storage.CustomerMeta;
 import com.diy.blueprints.collabeditor.persistence.storage.git.GitDocumentStorageService;
+import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.util.List;
 import java.util.stream.Collectors;
@@ -36,6 +38,14 @@ public class MultiTenantAdminController {
     return storage.listCustomerIds().stream()
         .map(id -> new CustomerSummary(id, storage.readCustomerMeta(id).map(CustomerMeta::displayName).orElse(id)))
         .collect(Collectors.toList());
+  }
+
+  @GetMapping("/customers/{customerId}")
+  public CustomerSummary getCustomer(@PathVariable String customerId) {
+    if (!storage.customerExists(customerId)) {
+      throw new ResponseStatusException(HttpStatus.NOT_FOUND, "no such customer: " + customerId);
+    }
+    return new CustomerSummary(customerId, storage.readCustomerMeta(customerId).map(CustomerMeta::displayName).orElse(customerId));
   }
 
   public record CreateCustomerRequest(String customerId, String displayName) {}

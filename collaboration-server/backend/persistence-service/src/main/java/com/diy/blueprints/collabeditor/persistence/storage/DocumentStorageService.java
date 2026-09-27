@@ -85,6 +85,24 @@ public interface DocumentStorageService {
   Optional<byte[]> load(DocumentRef doc, String versionName, String language);
 
   /**
+   * Everything needed to build a readable, decoded diff of the most recent
+   * checkpoint (see collab-server's changelogDiff.js): the state immediately
+   * BEFORE it (null if this version/language has fewer than two checkpoints
+   * yet -- nothing to be "before") and its own changelog (empty string if
+   * none). Bundled into one read on purpose, not two separate ones -- the
+   * first version of this DID split them (a previous-content call plus a
+   * changelog call), and a real checkpoint landing on the ref in between
+   * the two round trips silently mixed states from two different commits
+   * (found by testing: everything showed as "unchanged" because both calls
+   * had ended up resolving the SAME tip). Resolving the tip once and
+   * deriving both pieces from it closes that window.
+   */
+  RecentChanges loadRecentChanges(DocumentRef doc, String versionName, String language);
+
+  /** previousContent is null if there's no earlier checkpoint to diff against. */
+  record RecentChanges(byte[] previousContent, String changelogJson) {}
+
+  /**
    * The changelog committed alongside the most recent save for this
    * language -- individual per-save chunks since the previous commit on
    * this version, not the whole history (see save()'s own changelogJson

@@ -811,6 +811,82 @@ thread isn't picked back up for a while:
 
 ## Verified and working
 
+- **Readable "who changed what," decoded from Yjs and diffed, not from
+  markdown** (2026-09-27) -- a per-checkpoint changelog is only ever raw
+  Yjs binary deltas: readable for insertions (`Y.decodeUpdate` exposes
+  inserted text/attributes directly), but a deletion is only ever a
+  tombstone, `{clock, length}` -- never the deleted content (see
+  `unit/decode-chunk-*.mjs`). `content.md` can't help either: it's a
+  derived, write-only artifact for git diffs, never read back (see
+  `DocumentController`'s own comment). The fix reconstructs readable
+  before/after text around each changelog entry and word-diffs the two
+  (`diff`'s `diffWords`), recovering full insert *and* delete content --
+  proven in `tests/unit/changelog-diff.mjs`.
+  - **New**: `DocumentStorageService.loadRecentChanges(doc, versionName,
+    language)` -> `{previousContent, changelogJson}` -- the checkpoint
+    immediately before the current tip (null if there isn't one yet) plus
+    the tip's own changelog, both resolved off the SAME tip in one read.
+    `GET .../languages/{language}/recent-changes` on `DocumentController`;
+    `collab-server`'s new `changelogDiff.js` (`diffChangelog`) replays the
+    changelog entry by entry onto that previous state, rendering each step
+    through the same markdown pipeline `checkpointToGit` already uses and
+    diffing consecutive renders; `GET /api/customers/:customerId/
+    documents/:docId/versions/:versionName/languages/:language/changes`
+    on `collab-server` serves the result.
+  - **Real bug caught by testing, not by reasoning about the code**: the
+    first version of this fetched the previous checkpoint's content and the
+    current changelog as two SEPARATE persistence-service calls
+    (`Promise.all`). A real checkpoint landing on the ref between those two
+    round trips silently mixed states from two different commits -- every
+    change showed as "unchanged" because both calls had ended up resolving
+    the same tip by the time they ran. It reproduced reliably in this
+    session's own manual testing (repeated redeploys kept advancing the
+    tip via reconciliation checkpoints -- see below -- widening the race
+    window enough to hit every time). Fixed by bundling both reads into
+    one `DocumentStorageService` method that resolves the tip once and
+    derives both pieces from it, closing the window; `tests/integration/
+    readable-changes.mjs` pins the correct paired result end to end so a
+    future re-split would be caught.
+  - **Also observed while testing, not a bug**: every `collab-server`
+    restart re-runs `reconcileFastTierOnStartup`, which marks any room
+    with matching fast-tier data dirty again regardless of whether its
+    content actually changed -- so a room that was already fully
+    checkpointed gets one more, empty-changelog "restored" commit about
+    `GIT_CHECKPOINT_INTERVAL_MS` after each restart. Deliberate
+    (crash-recovery erring toward re-checking rather than trusting it's
+    fine), but it means `/changes` can occasionally show zero changes for
+    a version that was, in fact, just edited -- the edit is still one
+    commit further back by then, not lost.
+  - **Outage-risk note, not fixed, expected to be rare**: `entry.changelog`
+    (the in-memory list `diffChangelog` eventually replays) only clears on
+    a *successful* checkpoint -- so during a sustained outage (persistence-
+    service down, or the stale-room-name incident from 2026-09-24/26), it
+    keeps growing every debounce cycle instead of resetting every ~60s.
+    Normally that means a handful of entries per checkpoint (the debounce/
+    maxDebounce config bounds it to roughly 2-7 per active editor per
+    interval); after an outage, whoever opens `/changes` for that version
+    replays however many entries piled up over the WHOLE outage in one
+    call, not just one interval's worth. Bounded, not unbounded, and rare
+    by construction (it only happens during an outage) -- but worth
+    knowing before assuming `/changes` is always cheap.
+  - **Auto-commit interval is already fully configurable**, confirmed
+    rather than assumed: `GIT_CHECKPOINT_INTERVAL_MS` (`server.js`), set in
+    `docker/docker-compose.yml` (currently `60000`). Changing it (e.g. to
+    5 minutes for normal usage, as discussed) is a one-line env var edit
+    and a restart, no code or rebuild.
+  - **Test-infrastructure gotcha hit while verifying this**: installing
+    `backend/collab-server`'s own dependencies for `changelog-diff.mjs`
+    (needed, same as `markdown-roundtrip.mjs`) left `backend/collab-server/
+    node_modules` on disk, which then broke the *separate* scenario suite
+    (`tests/scenarios/`, 7/7 -> 1/7) -- `mergeDocs.js` lives inside that
+    directory, so Node started resolving its `import 'yjs'` from the
+    closer install instead of the root one every other test in `tests/`
+    shares, silently reintroducing the two-copies-of-yjs `instanceof`
+    breakage `tests/README.md`'s Setup section already warns about. No
+    error, just a clean merge quietly looking like it dropped edits.
+    `tests/README.md` now says to remove that directory again before
+    running anything under `scenarios/`.
+
 - **Scenario test suite for versions/edits/merges** (2026-09-25) --
   `tests/scenarios/`: plain-text `.scn` scripts (branch, insert/replace/
   delete/set/add, merge, expect) played against real Y.Docs, producing a
@@ -845,9 +921,31 @@ thread isn't picked back up for a while:
   commit was 21:53 the day before. Recovered by moving the fast-tier files
   to the correct room name after verifying the stale state was a strict
   superset of git's (state-vector comparison), letting startup-reconcile
-  check it in. Not yet done (only the recovery was requested): redirect
-  `?doc=mt:...` in the frontend, and make `collab-server` reject a room whose
-  customer doesn't exist instead of accepting unsaveable edits.
+  check it in. It happened AGAIN two days later (the stale tab was still
+  open and kept accepting edits: 33 more bytes, unsaved), recovered the same
+  way, and then closed off for good (2026-09-27):
+  - `collab-server`'s `onConnect` now refuses a room whose customer doesn't
+    exist, asking a new `GET /api/mt/customers/{customerId}` on
+    `persistence-service` (200, or 404 for an unknown customer; backed by
+    `GitDocumentStorageService.customerExists`). It closes with code **4401**
+    and a readable reason on purpose -- 4401 is the one code the browser
+    provider treats as permanent and stops reconnecting on; any other code
+    makes it retry forever. It fails OPEN if persistence-service can't be
+    reached or errors (only a definitive 404 refuses): the fast tier already
+    protects edits while it's down, and locking every editor out because a
+    dependency restarted would be worse than the case this guards against.
+  - The frontend strips a legacy `?doc=mt:...` prefix and rewrites the
+    address bar in place, and shows `Not connected -- unknown customer "x"`
+    (editor made read-only) when a room is refused, instead of a
+    normal-looking editor that never syncs.
+  - New `tests/integration/room-rejects-unknown-customer.mjs`: an unknown
+    customer and the legacy `default@master` shape are refused with 4401 and
+    not retried in a loop, and a real customer's room still syncs. Verified
+    in a real browser too: the legacy URL lands in the working room (badge,
+    dropdown, editable, text all correct) and a bogus customer shows the
+    message with a read-only editor. Already-open tabs running the OLD
+    frontend code can't show the message, but do stop retrying (4401) and
+    log the reason in their console.
 - **Found during that recovery, then fixed (2026-09-27): `localStore.compact()`
   was not crash-safe.** It used `fs.writeFile`, which truncates the target
   before writing, so a stop that killed the process mid-write left an EMPTY

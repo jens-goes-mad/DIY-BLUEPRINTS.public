@@ -19,8 +19,20 @@ cd .. # collaboration-server/
 npm install
 ```
 
-`markdown/markdown-roundtrip.mjs` is the one exception — see its own
-section below, it needs a second, separate install.
+`markdown/markdown-roundtrip.mjs` and `unit/changelog-diff.mjs` are the
+exceptions — see their own sections below, they need `backend/collab-
+server`'s own install too. **Remove `backend/collab-server/node_modules`
+again once you're done with those** (`rm -rf ../backend/collab-server/
+node_modules`) before running anything under `scenarios/` or anything else
+that imports from `backend/collab-server/src/` (`mergeDocs.js`,
+`conflicts.js`) — hit directly by testing (2026-09-27): once that install
+exists on disk, Node resolves `mergeDocs.js`'s own `import 'yjs'` from the
+CLOSER `backend/collab-server/node_modules`, not the root install this
+whole directory is built around, silently reintroducing the exact two-
+copies-of-yjs failure this section opens with. It doesn't announce itself
+as an error -- `conflicts.js`'s `instanceof` checks just quietly stop
+matching, and a real clean merge started looking like edits were being
+dropped.
 
 ## `unit/` — pure Yjs behavior, no running services needed
 
@@ -56,6 +68,18 @@ section below, it needs a second, separate install.
   left, and overlapping compactions of one document don't corrupt each
   other. Regression test for a real loss (2026-09-24, see STATE.md): fails
   on the original `fs.writeFile` implementation.
+- **`changelog-diff.mjs`** — imports the actual `changelogDiff.js` and
+  proves it recovers full insert AND delete content (not just a delta's
+  tombstone length), chains sequential entries correctly, reproduces the
+  live document's real final state when replayed end to end, and treats a
+  missing previous checkpoint as empty rather than an error. Needs
+  `backend/collab-server`'s own dependencies installed (same reason as
+  `markdown-roundtrip.mjs` below):
+
+  ```sh
+  (cd ../backend/collab-server && npm install)
+  node changelog-diff.mjs
+  ```
 
 Run any of them directly:
 
@@ -106,11 +130,31 @@ ports: `1234`/`3000` for collab-server, `8081` for persistence-service).
   different values returns exactly one correctly-typed conflict and —
   confirmed by comparing the target branch's stored snapshot before and
   after — commits nothing at all.
+- **`room-rejects-unknown-customer.mjs`** — collab-server must refuse a live
+  editing room whose customer doesn't exist (close code 4401, readable
+  reason, not retried in a loop) and keep accepting rooms whose customer
+  does. Regression test for the 2026-09-24 incident where such a room was
+  accepted and a day of edits could never be checkpointed (see STATE.md).
+- **`readable-changes.mjs`** — drives persistence-service's content endpoint
+  directly to create two deterministic checkpoints, then confirms the real
+  `GET .../changes` endpoint returns the correct readable, attributed,
+  word-diffed change. Regression test for a real bug (2026-09-27, see
+  STATE.md): the first version fetched the previous checkpoint's content
+  and the current changelog as two separate calls, and a checkpoint
+  landing in between silently mixed states from two different commits.
+
+- **`room-rejects-unknown-customer.mjs`** — collab-server must refuse a live
+  editing room whose customer doesn't exist (close code 4401, readable
+  reason, not retried in a loop) and keep accepting rooms whose customer
+  does. Regression test for the 2026-09-24 incident where such a room was
+  accepted and a day of edits could never be checkpointed (see STATE.md).
 
 ```sh
 node integration/branch-merge-e2e.mjs
 node integration/changelog-replay.mjs
 node integration/merge-with-conflict-detection.mjs
+node integration/room-rejects-unknown-customer.mjs
+node integration/readable-changes.mjs
 ```
 
 ## `scenarios/` — plain-text version/edit/merge scripts, played against real Yjs

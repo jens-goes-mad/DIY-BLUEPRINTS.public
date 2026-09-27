@@ -12,6 +12,7 @@
     "@tiptap/extension-image": "^2.5.9",
     "@tiptap/starter-kit": "^2.5.9",
     "cors": "^2.8.5",
+    "diff": "^7.0.0",
     "express": "^4.19.2",
     "markdown-it": "^14.1.0",
     "prosemirror-markdown": "^1.13.1",
