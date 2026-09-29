@@ -7,6 +7,7 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.Base64;
 import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * The tenant-scoped content API a real editing session uses once
@@ -125,6 +126,28 @@ public class DocumentController {
     DocumentStorageService.RecentChanges changes = storage.loadRecentChanges(doc, versionName, language);
     String previousYdoc = changes.previousContent() == null ? null : Base64.getEncoder().encodeToString(changes.previousContent());
     return new RecentChangesResponse(previousYdoc, changes.changelogJson());
+  }
+
+  // The ranged version: every checkpoint strictly after `from` up to and
+  // including `to`, oldest first -- "list all changes between two commits"
+  // rather than just the most recent one. `to` defaults to this URL's own
+  // versionName (its current tip) when omitted; `from` is required on
+  // purpose (see DocumentStorageService.loadChangesBetween's javadoc).
+  public record ChangeRangeResponse(String commitId, String previousYdoc, String changelog) {}
+
+  @GetMapping("/customers/{customerId}/documents/{docId}/versions/{versionName}/languages/{language}/changes-between")
+  public List<ChangeRangeResponse> changesBetween(@PathVariable String customerId, @PathVariable String docId,
+                                                    @PathVariable String versionName, @PathVariable String language,
+                                                    @RequestParam String from,
+                                                    @RequestParam(required = false) String to) {
+    DocumentRef doc = new DocumentRef(customerId, docId);
+    String toRevision = to != null ? to : versionName;
+    return storage.loadChangesBetween(doc, from, toRevision, language).stream()
+        .map(c -> new ChangeRangeResponse(
+            c.commitId(),
+            c.previousContent() == null ? null : Base64.getEncoder().encodeToString(c.previousContent()),
+            c.changelogJson()))
+        .collect(Collectors.toList());
   }
 
   @PutMapping("/customers/{customerId}/documents/{docId}/versions/{versionName}/languages/{language}/content")

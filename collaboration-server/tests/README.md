@@ -142,6 +142,21 @@ ports: `1234`/`3000` for collab-server, `8081` for persistence-service).
   STATE.md): the first version fetched the previous checkpoint's content
   and the current changelog as two separate calls, and a checkpoint
   landing in between silently mixed states from two different commits.
+- **`checkpoint-baseline-reset.mjs`** — drives a real Hocuspocus session
+  (not a direct content-PUT bypass) across two real, separate checkpoints
+  on one stable connection, and confirms the second checkpoint's changelog
+  replays onto the first to reproduce the exact stored state, and its
+  readable diff shows only the second edit, not the first reappearing.
+  Regression test for a real bug (2026-09-30, see STATE.md) found while
+  investigating a `changes-between` result: a changelog delta could be
+  computed relative to a stale baseline and replay into something that
+  didn't match what was actually committed.
+- **`changes-between.mjs`** — three deterministic checkpoints, then
+  confirms `GET .../changes-between` returns exactly the checkpoints after
+  `from` up to `to`, oldest first, correctly attributed/diffed; that
+  omitting `to` defaults to the version's current tip; and that a `from`
+  that isn't actually an ancestor of `to` fails with a clear error instead
+  of silently walking to the document's first commit.
 
 - **`room-rejects-unknown-customer.mjs`** — collab-server must refuse a live
   editing room whose customer doesn't exist (close code 4401, readable
@@ -155,6 +170,8 @@ node integration/changelog-replay.mjs
 node integration/merge-with-conflict-detection.mjs
 node integration/room-rejects-unknown-customer.mjs
 node integration/readable-changes.mjs
+node integration/changes-between.mjs
+node integration/checkpoint-baseline-reset.mjs
 ```
 
 ## `scenarios/` — plain-text version/edit/merge scripts, played against real Yjs

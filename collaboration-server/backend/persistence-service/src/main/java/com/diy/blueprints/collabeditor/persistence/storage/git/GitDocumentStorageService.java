@@ -28,6 +28,7 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -147,6 +148,19 @@ public class GitDocumentStorageService implements DocumentStorageService {
 
   private Path repoPath(String customerId) {
     return reposRoot.resolve(customerId + ".git");
+  }
+
+  /**
+   * versionOrRevision is usually a real named version, but may also be an
+   * opaque revision identifier this class previously handed back (see
+   * save()/createVersion()/findMergeBase()'s own javadoc) -- e.g.
+   * collab-server loading content as of the merge-base commit before a
+   * 3-way merge, which has no version name of its own. Shared by every
+   * method that accepts that same dual meaning (load(), loadChangesBetween()).
+   */
+  private static ObjectId resolveVersionOrRevision(Repository repo, DocumentRef doc, String versionOrRevision) throws IOException {
+    ObjectId id = repo.resolve(refName(doc, versionOrRevision));
+    return id != null ? id : repo.resolve(versionOrRevision);
   }
 
   private Repository openRepo(String customerId) throws IOException {
@@ -305,15 +319,7 @@ public class GitDocumentStorageService implements DocumentStorageService {
   public Optional<byte[]> load(DocumentRef doc, String versionName, String language) {
     return unchecked("failed to load " + doc.docId() + "/" + language, () -> {
       try (Repository repo = openRepo(doc.customerId())) {
-        // versionName is usually a real named version, but may also be an
-        // opaque revision identifier this class previously handed back
-        // (see save()/createVersion()/findMergeBase()'s own javadoc) --
-        // e.g. collab-server loading content as of the merge-base commit
-        // before a 3-way merge, which has no version name of its own.
-        ObjectId commitId = repo.resolve(refName(doc, versionName));
-        if (commitId == null) {
-          commitId = repo.resolve(versionName);
-        }
+        ObjectId commitId = resolveVersionOrRevision(repo, doc, versionName);
         if (commitId == null) return Optional.empty();
         ObjectId blobId = repo.resolve(commitId.getName() + ":" + languageDir(doc, language) + "/content.ydoc");
         if (blobId == null) return Optional.empty();
@@ -328,8 +334,7 @@ public class GitDocumentStorageService implements DocumentStorageService {
   public RecentChanges loadRecentChanges(DocumentRef doc, String versionName, String language) {
     return unchecked("failed to load recent changes for " + doc.docId() + "/" + language, () -> {
       try (Repository repo = openRepo(doc.customerId()); RevWalk revWalk = new RevWalk(repo)) {
-        ObjectId tipId = repo.resolve(refName(doc, versionName));
-        if (tipId == null) tipId = repo.resolve(versionName); // see load()'s own comment
+        ObjectId tipId = resolveVersionOrRevision(repo, doc, versionName);
         if (tipId == null) return new RecentChanges(null, "");
 
         // Read tip's own changelog and (from its parent) the previous
@@ -359,6 +364,69 @@ public class GitDocumentStorageService implements DocumentStorageService {
         }
 
         return new RecentChanges(previousContent, changelogJson);
+      }
+    });
+  }
+
+  // Above this, an implementation is free to refuse a `from` that never
+  // turns out to be an ancestor of `to` rather than walking arbitrarily far
+  // back (see this method's own interface javadoc) -- this is that refusal:
+  // a hard cap on how many first-parent hops loadChangesBetween will walk
+  // before giving up and reporting `from` as not found, rather than
+  // silently replaying all the way to the document's very first commit.
+  private static final int MAX_CHANGES_BETWEEN_WALK = 500;
+
+  @Override
+  public List<ChangeRange> loadChangesBetween(DocumentRef doc, String from, String to, String language) {
+    return unchecked("failed to load changes between " + from + " and " + to + " for " + doc.docId(), () -> {
+      try (Repository repo = openRepo(doc.customerId()); RevWalk revWalk = new RevWalk(repo)) {
+        ObjectId fromId = resolveVersionOrRevision(repo, doc, from);
+        ObjectId toId = resolveVersionOrRevision(repo, doc, to);
+        if (fromId == null) throw new IllegalStateException("from revision not found: " + from);
+        if (toId == null) throw new IllegalStateException("to revision not found: " + to);
+
+        // Manual first-parent walk from `to` back to `from`, rather than
+        // JGit's RevWalk markUninteresting/filter machinery -- this is a
+        // handful of lines whose correctness is easy to read directly,
+        // instead of leaning on RevWalk traversal-filter behavior this
+        // codebase has never exercised or verified before.
+        List<ChangeRange> newestFirst = new ArrayList<>();
+        RevCommit current = revWalk.parseCommit(toId);
+        while (!current.getId().equals(fromId)) {
+          String changelogJson = "";
+          ObjectId changelogBlobId = repo.resolve(current.getName() + ":" + languageDir(doc, language) + "/changelog.jsonl");
+          if (changelogBlobId != null) {
+            try (ObjectReader reader = repo.newObjectReader()) {
+              changelogJson = new String(reader.open(changelogBlobId).getBytes(), StandardCharsets.UTF_8);
+            }
+          }
+
+          byte[] previousContent = null;
+          if (current.getParentCount() > 0) {
+            ObjectId parentId = current.getParent(0);
+            ObjectId blobId = repo.resolve(parentId.getName() + ":" + languageDir(doc, language) + "/content.ydoc");
+            if (blobId != null) {
+              try (ObjectReader reader = repo.newObjectReader()) {
+                previousContent = reader.open(blobId).getBytes();
+              }
+            }
+          }
+          newestFirst.add(new ChangeRange(current.getName(), previousContent, changelogJson));
+
+          if (current.getParentCount() == 0) {
+            throw new IllegalStateException(
+                "from revision " + from + " is not an ancestor of " + to + " (reached the first commit first)");
+          }
+          if (newestFirst.size() >= MAX_CHANGES_BETWEEN_WALK) {
+            throw new IllegalStateException(
+                "from revision " + from + " not found within " + MAX_CHANGES_BETWEEN_WALK
+                    + " commits of " + to + " -- is it actually an ancestor?");
+          }
+          current = revWalk.parseCommit(current.getParent(0));
+        }
+
+        Collections.reverse(newestFirst); // walked newest-first; callers want oldest-first
+        return newestFirst;
       }
     });
   }

@@ -811,6 +811,130 @@ thread isn't picked back up for a while:
 
 ## Verified and working
 
+- **Fixed: a changelog entry's delta could be computed against a stale
+  baseline, making it replay into something that didn't match what was
+  actually committed** (2026-09-30) -- found while explaining a `changes-
+  between` result to the user: one specific real historical commit
+  (`cust-001`'s) showed an entry whose diff was entirely "unchanged" even
+  though the commit demonstrably added an image. Proved this by direct
+  byte-level replay (decoded the actual previous commit's content, applied
+  the actual stored delta, compared against the actual next commit's
+  content) -- the state vectors didn't match. Root cause: `entry.
+  lastSavedStateVector` (what a changelog delta is computed relative to)
+  only ever tracks the fast tier, bumped on every debounced save, never
+  reconciled against what git actually has. If a second `liveDocuments`
+  entry ever gets created for the same room (a stale/zombie reconnect
+  leaves an orphaned entry whose own in-memory changelog is lost, while
+  the fast tier's cumulative content survives into a fresh entry with an
+  empty changelog -- ties back to the Playwright close()/zombie-connection
+  observation from 2026-09-28), the next real delta only covers what
+  changed since that fresh entry started, not everything since the last
+  git commit. Fixed by resetting `entry.lastSavedStateVector` to the
+  just-committed state at the end of every successful `checkpointToGit` --
+  closes the window for a single stable entry; does NOT by itself prevent
+  a second entry from ever being created for the same room, which stays a
+  deliberately not-chased question (explicit call: "we should not hunt
+  ghosts" -- git content and the fast tier were reset instead of digging
+  further, see below). New `tests/integration/checkpoint-baseline-
+  reset.mjs` drives the REAL live-editing path (an actual Hocuspocus
+  session, not a direct content-PUT bypass) across two real, ~60s-apart
+  checkpoints on one stable connection, and confirms the second
+  checkpoint's changelog replays onto the first to reproduce the exact
+  stored state, and that its readable diff shows only the second edit, not
+  the first reappearing.
+  - **Also found along the way, still open**: the standalone `GET .../
+    changelog` endpoint doesn't accept a raw commit id, only a real version
+    name (unlike `load()`/`loadChangesBetween`, which both do) -- so it
+    silently returns empty for anything but a live branch tip. Not fixed;
+    `loadRecentChanges`/`loadChangesBetween` have their own correct inline
+    resolution and don't depend on it.
+  - **Decision: reset the data instead of chasing the zombie-connection
+    root cause further.** All existing git repos (`/data/repos`) and fast-
+    tier state (`/data/live`) were wiped after this fix landed, rather than
+    continuing to debug already-messy multi-day test history. Practical
+    consequence: every customer/document from earlier in this project's
+    testing is gone, including `cust-001` itself; a genuinely clean slate
+    going forward.
+
+- **"List all changes between two commits on a branch"** (2026-09-28) --
+  `DocumentStorageService.loadChangesBetween(doc, from, to, language)` ->
+  every checkpoint strictly after `from` up to and including `to`, oldest
+  first, following first-parent lineage; each entry is the same shape
+  `loadRecentChanges` returns (that checkpoint's own changelog plus the
+  content immediately before it) plus its commit id. Manually walked
+  first-parent from `to` back to `from` rather than leaning on JGit
+  `RevWalk`'s markUninteresting/filter machinery, which this codebase had
+  never exercised or verified before -- a handful of lines whose
+  correctness is easy to read directly beat gambling on an unverified API.
+  Capped at 500 hops: a `from` that never turns out to be `to`'s ancestor
+  throws a clear error instead of silently walking to the document's very
+  first commit. `GET .../languages/{language}/changes-between?from=&to=`
+  on `DocumentController` (`to` defaults to the URL's own `versionName`,
+  `from` is required on purpose -- see the outage-risk note above: an
+  unbounded "from the beginning" default would make replaying however
+  large a backlog exists the easy path instead of a deliberate one); same
+  shape on `collab-server`, reusing `changelogDiff.js` per checkpoint in
+  the range. `tests/integration/changes-between.mjs` covers three
+  deterministic checkpoints (correct range, correct oldest-first order,
+  correct default `to`) and the not-an-ancestor error case; also verified
+  directly against a real, messy branch (`cust-001`'s), correctly walking
+  past several empty-changelog `restored` checkpoints to the one real edit
+  in the range.
+  - **Real bug caught by testing, not by reasoning about the code**: Spring
+    Boot's default error handling swallows an exception's own message into
+    a generic "Internal Server Error" with no detail -- the deliberately
+    clear errors above (`from revision not found`, `not an ancestor of
+    to`) never reached any caller, defeating the entire point of throwing
+    them. This wasn't new to this feature either: `createVersion`'s
+    "version already exists" and `deleteVersion`'s master-protection had
+    the exact same silent-swallowing problem all along, just never
+    surfaced because nothing had needed to read the message before. Fixed
+    globally, not just for this endpoint: new `GlobalExceptionHandler`
+    (`@RestControllerAdvice`) maps `IllegalArgumentException`/
+    `IllegalStateException` to 400 and `StorageException` to 500, both
+    with the real message in the body. Changes the HTTP status code on
+    those pre-existing error paths (500 -> 400) for anything checking
+    status codes rather than just `!res.ok`; grepped the whole `tests/`
+    tree for a hardcoded expectation of the old status first -- found
+    none.
+
+- **Investigated, not conclusively fixed: the periodic git-checkpoint sweep
+  silently stopped firing for over 30 minutes** (2026-09-28), across every
+  room, not just one -- found while trying to demonstrate the changelog-diff
+  feature live. Ruled out directly, not just assumed: a process crash (the
+  process stayed responsive to HTTP the whole time, near-idle CPU/memory),
+  a code bug taking down the interval (`checkpointToGit` is an `async
+  function`, so any exception inside it -- even a synchronous one --
+  becomes a rejected promise the sweep loop's own `.catch()` already
+  handles; traced this through the real code, not assumed), a wrong env
+  var (`GIT_CHECKPOINT_INTERVAL_MS` was `60000` throughout), and a
+  Docker-level event (`docker events` shows nothing in the window). What
+  the timeline shows: a confirmed-dirty entry (its fast-tier file was
+  visibly growing) sat unattended through at least five consecutive 60s
+  interval boundaries with neither a success nor a `[git-checkpoint]
+  failed` log line -- not "nothing was dirty," but "something was dirty
+  and the sweep never looked." A `docker compose restart` immediately
+  fixed it. Best remaining hypothesis, NOT proven: this session spans
+  several real calendar days with long gaps between turns, almost
+  certainly including the host machine sleeping; Docker Desktop's Linux VM
+  can resume from a host sleep with its timers disrupted in ways that
+  don't crash anything or block HTTP handling, just quietly stop a
+  `setInterval` from firing until something resyncs it. Recommended, not
+  yet built: a heartbeat log (or a "seconds since last sweep tick" field
+  on `/api/health`) so a recurrence is observable within minutes instead
+  of discovered by accident 30 minutes in.
+  - **Also observed while chasing this, separately unresolved**:
+    Playwright's `page.close()`/`browser.close()` did not reliably close
+    the WebSocket connection server-side in two of three attempts --
+    `netstat` inside the container still showed the connection open
+    afterward, so `afterUnloadDocument` (and its immediate checkpoint)
+    never fired for those sessions; leaving the connection open and
+    letting the periodic sweep catch it worked every time. Not yet known
+    whether this is a Playwright/Docker-networking quirk specific to this
+    test setup or something in `collab-server`'s own disconnect handling;
+    real browsers navigating away normally weren't observed to have this
+    problem, only this specific close-the-whole-browser-process pattern.
+
 - **Readable "who changed what," decoded from Yjs and diffed, not from
   markdown** (2026-09-27) -- a per-checkpoint changelog is only ever raw
   Yjs binary deltas: readable for insertions (`Y.decodeUpdate` exposes

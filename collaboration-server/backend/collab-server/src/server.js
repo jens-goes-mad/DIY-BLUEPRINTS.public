@@ -5,7 +5,7 @@ import express from 'express'
 import cors from 'cors'
 import { schema } from './schema.js'
 import { createMarkdownSerializer } from './markdown.js'
-import { loadSnapshot, saveSnapshot, customerExists, loadRecentChanges } from './persistenceClient.js'
+import { loadSnapshot, saveSnapshot, customerExists, loadRecentChanges, loadChangesBetween } from './persistenceClient.js'
 import { diffChangelog, parseChangelog } from './changelogDiff.js'
 import { loadLocal, appendDelta, compact, COMPACT_LOG_BYTES, listLocalDocuments } from './localStore.js'
 import { mergeBranches } from './mergeBranches.js'
@@ -132,6 +132,30 @@ httpApp.get('/api/customers/:customerId/documents/:docId/versions/:versionName/l
   }
 })
 
+// "List all changes between two commits on a branch" -- the ranged version
+// of /changes above. ?from= is required (see persistenceClient.loadChangesBetween's
+// own comment on why there's no unbounded "from the start" default); ?to=
+// defaults to this version's current tip. Returns one entry per checkpoint
+// in the range, each with the SAME diff shape /changes returns for one.
+httpApp.get('/api/customers/:customerId/documents/:docId/versions/:versionName/languages/:language/changes-between', async (req, res) => {
+  const { customerId, docId, versionName, language } = req.params
+  const { from, to } = req.query
+  if (!from) {
+    return res.status(400).json({ error: 'from is required (a version name or a commit id previously seen, e.g. from an earlier changes-between/changes call)' })
+  }
+  try {
+    const checkpoints = await loadChangesBetween(customerId, docId, versionName, language, from, to)
+    const changes = checkpoints.map(({ commitId, previousBytes, changelog }) => ({
+      commitId,
+      changes: diffChangelog(previousBytes, parseChangelog(changelog)),
+    }))
+    res.json({ changes })
+  } catch (err) {
+    console.error(`[changes-between] failed for "${customerId}/${docId}@${versionName}/${language}" (${from}..${to || versionName}):`, err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
 httpApp.listen(HTTP_PORT, () => {
   console.log(`collab-server HTTP API listening on :${HTTP_PORT}`)
 })
@@ -154,6 +178,25 @@ async function checkpointToGit(documentName, entry) {
   entry.dirty = false
   entry.contributors.clear()
   entry.changelog = []
+  // entry.lastSavedStateVector otherwise only tracks the fast tier (bumped
+  // by onStoreDocument on every debounced save), never reconciled against
+  // what git actually just received -- so the NEXT changelog entry's delta
+  // would be computed relative to whatever the fast tier last saw, not
+  // relative to this commit. Normally those are the same state anyway, but
+  // if a second liveDocuments entry ever gets created for this same room
+  // (found by testing, 2026-09-30 -- a stale/zombie reconnect leaves an
+  // orphaned entry whose own in-memory changelog is lost, while the fast
+  // tier's cumulative content survives and gets bootstrapped into a FRESH
+  // entry with an empty changelog), the next real delta only covers what
+  // changed since that fresh entry started, not everything since the last
+  // git commit -- replaying it onto "the previous commit" then produces
+  // something that doesn't match what's actually stored. Resetting this
+  // right after every successful checkpoint keeps this entry's own future
+  // deltas anchored to what git now has, closing that window for this
+  // entry; it does not by itself prevent a second entry from ever being
+  // created for the same room (a separate, deliberately not-yet-chased
+  // question -- see STATE.md).
+  entry.lastSavedStateVector = Y.encodeStateVector(entry.document)
   console.log(`git-checkpoint -> "${documentName}" (edited by ${contributors})`)
 }
 

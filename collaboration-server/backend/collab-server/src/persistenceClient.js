@@ -73,6 +73,26 @@ export async function loadRecentChanges(customerId, docId, versionName, language
   }
 }
 
+// The ranged version: every checkpoint strictly after `from` up to and
+// including `to` (defaults to this version's current tip on the server side
+// when omitted), oldest first. Each entry has the same two fields
+// loadRecentChanges returns, plus which checkpoint it came from.
+export async function loadChangesBetween(customerId, docId, versionName, language, from, to) {
+  const url =
+    `${PERSISTENCE_URL}/api/mt/customers/${encodeURIComponent(customerId)}/documents/` +
+    `${encodeURIComponent(docId)}/versions/${encodeURIComponent(versionName)}/languages/` +
+    `${encodeURIComponent(language)}/changes-between?from=${encodeURIComponent(from)}` +
+    (to ? `&to=${encodeURIComponent(to)}` : '')
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`persistence-service changes-between load failed: ${res.status}: ${await res.text()}`)
+  const body = await res.json()
+  return body.map((c) => ({
+    commitId: c.commitId,
+    previousBytes: c.previousYdoc ? Buffer.from(c.previousYdoc, 'base64') : null,
+    changelog: c.changelog ?? '',
+  }))
+}
+
 export async function findMergeBase(customerId, docId, versionA, versionB) {
   const url =
     `${PERSISTENCE_URL}/api/mt/customers/${encodeURIComponent(customerId)}/documents/` +

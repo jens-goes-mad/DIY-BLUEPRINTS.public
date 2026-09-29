@@ -103,6 +103,26 @@ public interface DocumentStorageService {
   record RecentChanges(byte[] previousContent, String changelogJson) {}
 
   /**
+   * Every checkpoint strictly after `from` up to and including `to`,
+   * oldest first -- the ranged version of loadRecentChanges (which only
+   * ever looks at the single most recent checkpoint). Each entry is the
+   * same shape RecentChanges carries (that checkpoint's own changelog plus
+   * the content immediately before it), plus which checkpoint it came
+   * from. `from` and `to` are each resolved the same way load()'s
+   * versionName is (a real version name, or an opaque revision identifier
+   * previously handed back). Both required on purpose, not "from the
+   * beginning" -- an implementation is free to refuse (or cap) a request
+   * whose `from` isn't actually an ancestor of `to` rather than walking
+   * arbitrarily far back; an unbounded default would make replaying
+   * however large a backlog exists (see STATE.md's outage-risk note) the
+   * easy path instead of a deliberate one.
+   */
+  List<ChangeRange> loadChangesBetween(DocumentRef doc, String from, String to, String language);
+
+  /** commitId is this checkpoint's own identifier; previousContent/changelogJson are exactly RecentChanges' fields, one checkpoint earlier. */
+  record ChangeRange(String commitId, byte[] previousContent, String changelogJson) {}
+
+  /**
    * The changelog committed alongside the most recent save for this
    * language -- individual per-save chunks since the previous commit on
    * this version, not the whole history (see save()'s own changelogJson
